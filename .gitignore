@@ -1,0 +1,9 @@
+data/
+models/
+outputs/
+__pycache__/
+*.pkl
+*.csv
+*.xls
+*.xlsx
+.env
