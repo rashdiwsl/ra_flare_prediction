@@ -57,7 +57,7 @@ def choose_location():
 
 def get_weather(city_name):
     try:
-        API_KEY = "YOUR_OPENWEATHERMAP_API_KEY"
+        API_KEY = "d36f2091f62593505c35c8451d609aa8"
         r = requests.get(
             f"http://api.openweathermap.org/data/2.5/weather"
             f"?q={city_name}&appid={API_KEY}&units=metric",
@@ -278,12 +278,6 @@ def collect_and_predict():
                  "🟢 LOW RISK     ")
 
         print(f"\n  Day +{day}:  {label}  (score: {risk:.2f})")
-        print(f"           Pain/Joint : {p_ra:.2f}  | "
-              f" SL-RA      : {p_sl:.2f}")
-        print(f"           Sleep      : {p_sleep:.2f}  | "
-              f" Heart/HRV  : {p_hrv:.2f}")
-        print(f"           Clinical   : {clinical_score:.2f}  | "
-              f" ML Fusion  : {meta_score:.2f}")
 
     # ── Summary & Advice ──────────────────────────────────────────────────────
     peak = max(day_risks)
