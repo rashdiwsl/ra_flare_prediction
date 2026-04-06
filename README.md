@@ -16,12 +16,19 @@ flare risk for the next 3 days, designed for Sri Lankan patients.
 - Random Forest (Sri Lankan RA) — 87.5% accuracy
 - Meta fusion classifier — Logistic Regression
 
+## 🎥 Demo Video
+[(link here)](https://drive.google.com/file/d/1b8L1t0CE5Pz0CVhBLDsdnRcjX8JzGxYT/view?usp=sharing)
 ## Run
 ```bash
 python 1_train_models.py
 python 2_fusion.py
 python 3_patient_console.py
 ```
+
+
+
+## 👩‍💻 Author
+RMRBD Rathnayake
 
 ## Features
 - Simple plain-language questions for patients
