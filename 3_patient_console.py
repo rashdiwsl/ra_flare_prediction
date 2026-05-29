@@ -57,7 +57,7 @@ def choose_location():
 
 def get_weather(city_name):
     try:
-        API_KEY = "d36f2091f62593505c35c8451d609aa8"
+        API_KEY = "Add api key"
         r = requests.get(
             f"http://api.openweathermap.org/data/2.5/weather"
             f"?q={city_name}&appid={API_KEY}&units=metric",
