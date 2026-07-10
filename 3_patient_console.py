@@ -12,94 +12,398 @@ Clinical standards:
 
 import streamlit as st
 import numpy as np
-import joblib, requests, warnings
-warnings.filterwarnings('ignore')
+import requests
+import joblib
+import os
+from datetime import datetime, timedelta
 
-# ── Load all models once ──────────────────────────────────────────────────────
-ra_model    = joblib.load("models/ra_model.pkl")["model"]
-sleep_model = joblib.load("models/sleep_model.pkl")["model"]
-hrv_model   = joblib.load("models/hrv_model.pkl")["model"]
-sl_ra_model = joblib.load("models/sl_ra_model.pkl")["model"]
-meta_model  = joblib.load("models/meta_model.pkl")
+st.set_page_config(
+    page_title="RA FlareGuard",
+    page_icon="🫀",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
-def ask(prompt, lo, hi):
-    while True:
-        try:
-            v = float(input(f"\n  {prompt}\n  👉 Your answer [{lo}-{hi}]: "))
-            if lo <= v <= hi:
-                return v
-            print(f"  ⚠  Please enter a number between {lo} and {hi}")
-        except ValueError:
-            print("  ⚠  Please type a number.")
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Fraunces:ital,wght@0,300;0,600;1,300&display=swap');
 
-def get_name():
-    while True:
-        name = input("\n  What is your full name? : ").strip()
-        if name:
-            return name
-        print("  ⚠  Name cannot be empty. Please enter your name.")
+:root{
+  --bg:#070b14; --surface:#0e1420; --card:#141b28;
+  --border:#1d2a3f; --border2:#263245;
+  --teal:#2dd4bf; --teal2:#0f766e;
+  --blue:#60a5fa; --violet:#a78bfa;
+  --amber:#fbbf24; --amber-bg:#2a1500;
+  --red:#f87171;   --red-bg:#1f0303;
+  --green:#4ade80; --green-bg:#031a0a;
+  --text:#e2eaf5;  --text2:#7a90b0; --text3:#3d4f68;
+  --r:14px; --r2:8px;
+}
 
-def choose_location():
-    cities = {
-        "1":  ("Colombo",      6.9271,  79.8612),
-        "2":  ("Kandy",        7.2906,  80.6337),
-        "3":  ("Galle",        6.0535,  80.2210),
-        "4":  ("Jaffna",       9.6615,  80.0255),
-        "5":  ("Negombo",      7.2081,  79.8358),
-        "6":  ("Trincomalee",  8.5874,  81.2152),
-        "7":  ("Anuradhapura", 8.3114,  80.4037),
-        "8":  ("Matara",       5.9549,  80.5550),
-        "9":  ("Kurunegala",   7.4867,  80.3647),
-        "10": ("Badulla",      6.9895,  81.0557),
-        "11": ("Ratnapura",    6.6828,  80.3992),
-        "12": ("Other city",   None,    None   ),
-    }
-    print("\n  📍 Where are you located right now?")
-    print("  " + "-"*40)
-    for k, (name, _, _) in cities.items():
-        print(f"     {k:>2}.  {name}")
-    print("  " + "-"*40)
-    while True:
-        choice = input("  Type the number for your city: ").strip()
-        if choice in cities:
-            name, lat, lon = cities[choice]
-            if choice == "12":
-                name = input("  Type your city name: ").strip()
-            return name, lat, lon
-        print("  ⚠  Please type a number from the list above.")
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 
-def get_weather(city_name):
+html,body,[class*="css"]{
+  font-family:'Inter',sans-serif!important;
+  background:var(--bg)!important;
+  color:var(--text)!important;
+  -webkit-font-smoothing:antialiased;
+}
+
+#MainMenu,footer,header{visibility:hidden}
+.block-container{
+  padding:0!important;
+  max-width:680px!important;
+  margin:0 auto!important;
+}
+
+/* ── Progress bar ── */
+.prog-wrap{
+  position:sticky;top:0;z-index:100;
+  background:var(--bg);border-bottom:1px solid var(--border);
+  padding:10px 0 8px;
+}
+.prog-inner{max-width:680px;margin:0 auto;padding:0 24px}
+.prog-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.prog-label{font-size:0.7rem;font-weight:600;color:var(--teal);text-transform:uppercase;letter-spacing:0.1em}
+.prog-step{font-size:0.7rem;color:var(--text3)}
+.prog-track{height:3px;background:var(--border);border-radius:99px;overflow:hidden}
+.prog-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--teal2),var(--teal));transition:width 0.4s ease}
+
+/* ── Step wrapper ── */
+.step-wrap{padding:18px 24px 20px}
+
+/* ── Step header ── */
+.step-eyebrow{font-size:0.6rem;font-weight:600;text-transform:uppercase;letter-spacing:0.14em;color:var(--teal);margin-bottom:6px}
+.step-title{font-family:'Fraunces',serif;font-size:1.9rem;color:var(--text);line-height:1.1;margin-bottom:6px}
+.step-title em{color:var(--teal);font-style:italic}
+.step-desc{font-size:0.8rem;color:var(--text2);line-height:1.6;margin-bottom:12px}
+.step-cite{display:inline-flex;align-items:center;gap:5px;background:rgba(45,212,191,0.06);border:1px solid rgba(45,212,191,0.15);border-radius:5px;padding:3px 9px;font-size:0.62rem;color:var(--teal);margin-bottom:10px}
+
+/* ── Card ── */
+.qcard{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;margin-bottom:10px}
+.qcard-hdr{font-size:0.65rem;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text2);margin-bottom:8px;display:flex;align-items:center;gap:6px}
+.qcard-hdr::before{content:'';width:3px;height:11px;background:var(--teal);border-radius:2px;display:inline-block}
+
+/* ── Q item ── */
+.q-item{padding:7px 0;border-bottom:1px solid var(--border)}
+.q-item:last-child{border-bottom:none}
+.q-top{display:flex;gap:8px;margin-bottom:6px}
+.q-badge{width:20px;height:20px;background:var(--surface);border:1px solid var(--border2);border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:0.58rem;font-weight:700;color:var(--teal);flex-shrink:0;margin-top:1px}
+.q-text{font-size:0.8rem;color:var(--text);line-height:1.4}
+.q-ref{font-size:0.6rem;color:var(--text3);margin-top:2px}
+
+/* ── VAS slider visual ── */
+.vas-grad{height:5px;border-radius:3px;background:linear-gradient(to right,#4ade80,#fbbf24,#f87171);margin:4px 0 2px}
+.vas-ends{display:flex;justify-content:space-between;font-size:0.62rem;color:var(--text3);margin-bottom:6px}
+
+/* ── Scale chips ── */
+.scale-chips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 8px}
+.scale-chip{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:999px;font-size:0.65rem;font-weight:500}
+
+/* ── Nav buttons (in normal document flow, not fixed — avoids Streamlit's
+   scroll-container/transform clipping issues that hide fixed elements) ── */
+.nav-bar{
+  background:transparent;
+  border-top:1px solid var(--border);
+  padding:12px 0 4px;
+  margin-top:4px;
+}
+.nav-inner{max-width:680px;margin:0 auto;padding:0 24px;display:flex;gap:10px}
+
+/* Streamlit button overrides */
+.stButton>button{
+  font-family:'Inter',sans-serif!important;
+  font-size:0.84rem!important;font-weight:600!important;
+  border-radius:10px!important;padding:0.65rem 1.4rem!important;
+  transition:all 0.18s!important;border:none!important;
+}
+.stButton>button[kind="primary"],
+.stButton>button:not([kind]){
+  background:linear-gradient(135deg,var(--teal2),#1d4ed8)!important;
+  color:#fff!important;
+  box-shadow:0 3px 16px rgba(13,148,136,0.3)!important;
+}
+.stButton>button[kind="primary"]:hover,
+.stButton>button:not([kind]):hover{
+  transform:translateY(-1px)!important;
+  box-shadow:0 5px 22px rgba(13,148,136,0.45)!important;
+}
+.stButton>button[kind="secondary"]{
+  background:var(--card)!important;color:var(--text2)!important;
+  border:1px solid var(--border2)!important;
+}
+
+/* Widget overrides */
+div[data-testid="stSlider"] div[role="slider"]{
+  background:var(--teal)!important;
+  border:2px solid var(--bg)!important;
+  box-shadow:0 0 0 3px rgba(45,212,191,0.2)!important;
+}
+div[data-testid="stSelectSlider"] div[role="slider"]{
+  background:var(--blue)!important;
+  border:2px solid var(--bg)!important;
+  box-shadow:0 0 0 3px rgba(96,165,250,0.2)!important;
+}
+.stTextInput input,.stNumberInput input{
+  background:var(--card)!important;border:1px solid var(--border2)!important;
+  color:var(--text)!important;border-radius:9px!important;
+  font-family:'Inter',sans-serif!important;font-size:0.84rem!important;
+  padding:10px 14px!important;
+}
+.stTextInput input:focus,.stNumberInput input:focus{
+  border-color:var(--teal)!important;
+  box-shadow:0 0 0 3px rgba(45,212,191,0.1)!important;
+  outline:none!important;
+}
+.stSelectbox>div>div{
+  background:var(--card)!important;border:1px solid var(--border2)!important;
+  color:var(--text)!important;border-radius:9px!important;
+  font-family:'Inter',sans-serif!important;font-size:0.84rem!important;
+}
+label{color:var(--text2)!important;font-size:0.76rem!important;font-family:'Inter',sans-serif!important}
+.stMarkdown p{color:var(--text2)!important;font-size:0.8rem!important}
+.stNumberInput button{background:var(--card)!important;border-color:var(--border2)!important;color:var(--text2)!important}
+
+/* ── Results ── */
+.result-hero{text-align:center;padding:28px 0 20px}
+.result-name{font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:var(--text3);margin-bottom:6px}
+.result-score{font-family:'Fraunces',serif;font-size:5.5rem;line-height:1;margin-bottom:6px}
+.result-pill{display:inline-block;font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;padding:5px 16px;border-radius:999px;margin-bottom:10px}
+.result-pill.high  {background:var(--red-bg);color:var(--red);border:1px solid #4f0b0b}
+.result-pill.medium{background:var(--amber-bg);color:var(--amber);border:1px solid #5c2d00}
+.result-pill.low   {background:var(--green-bg);color:var(--green);border:1px solid #0a3d1a}
+.result-meta{font-size:0.72rem;color:var(--text3)}
+
+/* Forecast row */
+.fc-row{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:20px 0}
+.fc-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 8px;text-align:center;position:relative;overflow:hidden}
+.fc-box.now{border-color:rgba(45,212,191,0.35)}
+.fc-box.now::before{content:'NOW';position:absolute;top:0;left:0;right:0;background:var(--teal2);color:#fff;font-size:0.48rem;font-weight:800;letter-spacing:0.2em;padding:3px 0}
+.fc-day{font-size:0.58rem;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--text3);margin-top:4px}
+.fc-pct{font-family:'Fraunces',serif;font-size:2.2rem;line-height:1.1;margin:3px 0}
+.fc-badge{font-size:0.52rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;padding:2px 7px;border-radius:999px;display:inline-block;margin-bottom:4px}
+.fc-badge.high  {background:var(--red-bg);color:var(--red);border:1px solid #4f0b0b}
+.fc-badge.medium{background:var(--amber-bg);color:var(--amber);border:1px solid #5c2d00}
+.fc-badge.low   {background:var(--green-bg);color:var(--green);border:1px solid #0a3d1a}
+.fc-wx{font-size:0.58rem;color:var(--text3);line-height:1.4}
+
+/* R3 bars */
+.r3-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:18px 20px;margin:12px 0}
+.r3-row{margin-bottom:12px}
+.r3-top{display:flex;justify-content:space-between;font-size:0.72rem;margin-bottom:4px}
+.r3-lbl{color:var(--text2)}.r3-val{color:var(--text);font-weight:500}
+.r3-track{height:5px;background:var(--surface);border-radius:99px;overflow:hidden}
+.r3-fill{height:100%;border-radius:99px;transition:width 0.6s ease}
+.r3-total{border-top:1px solid var(--border);padding-top:12px;margin-top:4px}
+.r3-cats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:12px}
+.r3-cat{border-radius:7px;padding:7px 4px;text-align:center}
+.r3-catlbl{font-size:0.5rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.07em}
+.r3-catval{font-size:0.68rem;font-weight:600;margin-top:2px}
+
+/* Advisory */
+.adv{border-radius:var(--r);padding:18px 20px;margin:12px 0}
+.adv.high  {background:var(--red-bg);border:1px solid #4f0b0b}
+.adv.medium{background:var(--amber-bg);border:1px solid #5c2d00}
+.adv.low   {background:var(--green-bg);border:1px solid #0a3d1a}
+.adv-hdr{font-size:0.88rem;font-weight:600;margin-bottom:10px}
+.adv ul{list-style:none;padding:0}
+.adv li{font-size:0.78rem;color:var(--text);padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05);display:flex;gap:8px;line-height:1.5}
+.adv li:last-child{border-bottom:none}
+.adv-dot{flex-shrink:0;margin-top:4px;width:5px;height:5px;border-radius:50%}
+.adv-dot.high  {background:var(--red)}
+.adv-dot.medium{background:var(--amber)}
+.adv-dot.low   {background:var(--green)}
+
+/* Info chips row */
+.chips{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
+.chip{background:var(--card);border:1px solid var(--border);border-radius:7px;padding:4px 11px;font-size:0.68rem;color:var(--text2);display:flex;align-items:center;gap:5px}
+.chip b{color:var(--text);font-weight:500}
+
+/* Disclaimer */
+.disc{margin-top:14px;padding:12px 14px;background:var(--surface);border:1px solid var(--border);border-radius:9px;font-size:0.65rem;color:var(--text3);line-height:1.6}
+.disc b{color:var(--text2)}
+
+/* Restart */
+.restart-btn{text-align:center;margin-top:20px}
+
+/* ── Tap-to-select pill buttons (replaces drag sliders for scales) ── */
+div[data-testid="stRadio"] > div[role="radiogroup"]{
+  display:flex; flex-wrap:wrap; gap:8px; margin:6px 0 4px;
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label{
+  position:relative;
+  flex:1 1 58px;
+  min-width:58px;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--surface);
+  border:1.5px solid var(--border2);
+  border-radius:9px;
+  padding:9px 4px;
+  cursor:pointer;
+  transition:all .15s ease;
+  margin:0!important;
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:hover{
+  border-color:var(--teal);
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked){
+  background:linear-gradient(135deg,var(--teal2),#1d4ed8);
+  border-color:var(--teal);
+  box-shadow:0 3px 14px rgba(13,148,136,0.35);
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label:has(input:checked) p{
+  color:#fff!important; font-weight:700!important;
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label > div:first-child{
+  position:absolute; opacity:0; pointer-events:none; width:1px; height:1px; overflow:hidden;
+}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label p{
+  color:var(--text2)!important;
+  font-size:0.68rem!important;
+  font-weight:600!important;
+  text-align:center;
+  margin:0!important;
+  white-space:nowrap;
+}
+/* Compact numeric NRS pills (0-10 scales) get tighter min-width to fit a row */
+.nrs-wrap div[data-testid="stRadio"] div[role="radiogroup"] > label{
+  flex:1 1 30px; min-width:30px; padding:8px 2px;
+}
+.nrs-wrap div[data-testid="stRadio"] div[role="radiogroup"] > label p{
+  font-size:0.72rem!important;
+}
+/* Reduce Streamlit's default per-element vertical gap so sections feel tighter */
+div[data-testid="stVerticalBlock"]{ gap:0.35rem!important; }
+div[data-testid="element-container"]{ margin-bottom:0!important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+API_KEY = os.environ.get("OWM_API_KEY", "")
+
+CITIES = {
+    "Colombo":(30,78,1010),"Kandy":(26,72,1012),"Galle":(29,80,1009),
+    "Jaffna":(33,65,1008),"Negombo":(30,77,1010),"Trincomalee":(32,68,1007),
+    "Anuradhapura":(31,67,1008),"Matara":(28,81,1009),"Kurunegala":(29,73,1010),
+    "Badulla":(22,70,1015),"Ratnapura":(28,82,1009),
+}
+
+RAPID3_Qs = [
+    ("A","Dress yourself, including tying shoelaces and doing buttons?","HAQ item 1"),
+    ("B","Get in and out of bed?","HAQ item 2"),
+    ("C","Lift a full cup or glass to your mouth?","HAQ item 5"),
+    ("D","Walk outdoors on flat ground?","HAQ item 9"),
+    ("E","Wash and dry your entire body?","HAQ item 12"),
+    ("F","Bend down to pick up clothing from the floor?","HAQ item 14"),
+    ("G","Turn regular faucets (taps) on and off?","HAQ item 16"),
+    ("H","Get in and out of a car, bus, train, or vehicle?","HAQ item 18"),
+    ("I","Walk two miles or about three kilometres?","HAQ item 10"),
+    ("J","Participate in recreational activities as you wish?","HAQ item 20"),
+]
+DIFF = {0:"No difficulty",1:"Some difficulty",2:"Much difficulty",3:"Unable to do"}
+DIFF_C = {0:"#4ade80",1:"#facc15",2:"#fb923c",3:"#f87171"}
+DIFF_SHORT = {0:"0 · None",1:"1 · Some",2:"2 · Much",3:"3 · Unable"}
+
+TOTAL_STEPS = 7
+
+# ── Tap-to-select pill widgets (replace drag sliders) ───────────────────────────
+def diff_pills(key, current):
+    """0-3 difficulty scale as tap-to-select pill buttons."""
+    opts = [0,1,2,3]
+    idx = opts.index(int(current)) if int(current) in opts else 0
+    val = st.radio(key, options=opts, format_func=lambda x: DIFF_SHORT[x],
+                    index=idx, horizontal=True, key=key, label_visibility="collapsed")
+    return val
+
+def nrs_pills(key, current):
+    """0-10 numeric rating scale (validated NRS equivalent of a VAS) as tap-to-select pills."""
+    opts = list(range(11))
+    cur_i = int(round(float(current)))
+    cur_i = min(10, max(0, cur_i))
+    st.markdown('<div class="nrs-wrap">', unsafe_allow_html=True)
+    val = st.radio(key, options=opts, format_func=lambda x: str(x),
+                    index=cur_i, horizontal=True, key=key, label_visibility="collapsed")
+    st.markdown('</div>', unsafe_allow_html=True)
+    return float(val)
+
+# ── Session state ──────────────────────────────────────────────────────────────
+def init():
+    defaults = dict(
+        step=0,
+        name="", city="Colombo", age=45,
+        fn_vals={l:0 for l,_,_ in RAPID3_Qs},
+        sleep_diff=0, anxiety_val=0,
+        fatigue=3.0, pain=3.0, global_s=3.0,
+        flares30=2, duration=5, activity=30, heart_rate=75,
+        results=None,
+    )
+    for k,v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k]=v
+init()
+
+# ── Models ─────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def load_models():
+    d=os.path.join(os.path.dirname(__file__),"models")
     try:
-        API_KEY = "d36f2091f62593505c35c8451d609aa8"
-        r = requests.get(
-            f"http://api.openweathermap.org/data/2.5/weather"
-            f"?q={city_name}&appid={API_KEY}&units=metric",
-            timeout=5
-        ).json()
-        temp     = r["main"]["temp"]
-        humidity = r["main"]["humidity"]
-        pressure = r["main"]["pressure"]
-        desc     = r["weather"][0]["description"]
-        print(f"\n  🌤  Weather in {city_name}: {temp}°C, "
-              f"{humidity}% humidity — {desc}")
-        return temp, humidity, pressure
-    except:
-        print(f"\n  (Could not get live weather — "
-              f"using typical values for {city_name})")
-        defaults = {
-            "Colombo":     (30, 78, 1010),
-            "Kandy":       (26, 72, 1012),
-            "Galle":       (29, 80, 1009),
-            "Jaffna":      (33, 65, 1008),
-            "Matara":      (28, 81, 1009),
-            "Negombo":     (30, 77, 1010),
-            "Badulla":     (22, 70, 1015),
-            "Ratnapura":   (28, 82, 1009),
-            "Trincomalee": (32, 68, 1007),
-            "Anuradhapura":(31, 67, 1008),
-            "Kurunegala":  (29, 73, 1010),
-        }
-        return defaults.get(city_name, (29, 75, 1010))
+        ra   =joblib.load(os.path.join(d,"ra_model.pkl"))["model"]
+        sl   =joblib.load(os.path.join(d,"sleep_model.pkl"))["model"]
+        hrv  =joblib.load(os.path.join(d,"hrv_model.pkl"))["model"]
+        slra =joblib.load(os.path.join(d,"sl_ra_model.pkl"))["model"]
+        meta =joblib.load(os.path.join(d,"meta_model.pkl"))
+        return ra,sl,hrv,slra,meta,True
+    except Exception:
+        return None,None,None,None,None,False
+
+ra_m,sl_m,hrv_m,slra_m,meta_m,MODELS_OK=load_models()
+
+# ── Weather ────────────────────────────────────────────────────────────────────
+def wx_today(city):
+    if not API_KEY:
+        t,h,p=CITIES.get(city,(29,75,1010)); return t,h,p,"estimated"
+    try:
+        r=requests.get(f"http://api.openweathermap.org/data/2.5/weather?q={city},LK&appid={API_KEY}&units=metric",timeout=5).json()
+        return r["main"]["temp"],r["main"]["humidity"],r["main"]["pressure"],r["weather"][0]["description"]
+    except Exception:
+        t,h,p=CITIES.get(city,(29,75,1010)); return t,h,p,"estimated"
+
+def wx_forecast(city):
+    if not API_KEY:
+        t,h,p,_=wx_today(city)
+        return [{"date":(datetime.now()+timedelta(days=i+1)).strftime("%Y-%m-%d"),
+                 "temp":round(t+np.random.uniform(-1.5,1.5),1),
+                 "humidity":min(100,h+np.random.randint(-5,8)),
+                 "pressure":p+np.random.randint(-3,3),"desc":"estimated"} for i in range(3)]
+    try:
+        r=requests.get(f"http://api.openweathermap.org/data/2.5/forecast?q={city},LK&appid={API_KEY}&units=metric&cnt=24",timeout=5).json()
+        daily={}
+        for item in r["list"]:
+            d=item["dt_txt"].split(" ")[0]
+            daily.setdefault(d,{"t":[],"h":[],"p":[],"desc":[]})
+            daily[d]["t"].append(item["main"]["temp"])
+            daily[d]["h"].append(item["main"]["humidity"])
+            daily[d]["p"].append(item["main"]["pressure"])
+            daily[d]["desc"].append(item["weather"][0]["description"])
+        today=datetime.now().strftime("%Y-%m-%d"); out=[]
+        for ds in sorted(daily):
+            if ds==today or len(out)>=3: continue
+            dv=daily[ds]
+            out.append({"date":ds,"temp":round(sum(dv["t"])/len(dv["t"]),1),
+                        "humidity":round(sum(dv["h"])/len(dv["h"])),
+                        "pressure":round(sum(dv["p"])/len(dv["p"])),
+                        "desc":max(set(dv["desc"]),key=dv["desc"].count)})
+        if len(out)>=3: return out
+        raise Exception("insufficient forecast data")
+    except Exception:
+        t,h,p,_=wx_today(city)
+        return [{"date":(datetime.now()+timedelta(days=i+1)).strftime("%Y-%m-%d"),
+                 "temp":round(t+np.random.uniform(-1.5,1.5),1),
+                 "humidity":min(100,h+np.random.randint(-5,8)),
+                 "pressure":p+np.random.randint(-3,3),"desc":"estimated"} for i in range(3)]
+
+# ── Risk engine ────────────────────────────────────────────────────────────────
+def nrm(v,lo,hi): return float(np.clip((v-lo)/(hi-lo),0,1))
 
 def sprob(model,inputs):
     n=model.n_features_in_; arr=np.array(inputs,dtype=float)
@@ -555,25 +859,156 @@ elif step == 6:
     if not res:
         go(0)
     else:
-        print("\n  🟢 LOW RISK — You are doing well!")
-        print("  " + "─"*44)
-        print("  • Keep up your current routine")
-        print("  • Stay hydrated — drink water regularly")
-        print("  • Light walking is good for your joints")
-        print("  • Take your medicines as scheduled")
-        if humidity > 80:
-            print(f"\n  💧 Humidity is a bit high in {city_name} today.")
-            print("     Stay in cool areas when possible.")
+        risks = res["risks"]
+        peak  = max(risks)
+        plvl  = rlv(peak)
+        pcol  = rcl(peak)
+        r3    = res["r3"]
+        r3name, r3col = r3cat(r3)
+        fc    = res["forecast"]
 
-    print("\n" + "="*58)
+        st.markdown(f"""
+        <div class="step-wrap">
+          <div class="step-eyebrow">Your 3-Day Forecast · {st.session_state.city}</div>
+          <div class="result-hero">
+            <div class="result-name">{st.session_state.name} · Age {st.session_state.age}</div>
+            <div class="result-score" style="color:{pcol}">{peak:.0%}</div>
+            <div class="result-pill {plvl}">{rem(peak)} {rlv(peak).replace('medium','moderate').title()} Risk</div>
+            <div class="result-meta">
+              {datetime.now().strftime('%d %b %Y')} &nbsp;·&nbsp;
+              Peak risk over next 3 days
+            </div>
+          </div>
+        </div>""", unsafe_allow_html=True)
 
-# ── Main Loop ─────────────────────────────────────────────────────────────────
-print("\n  ✅  RA FLARE PREDICTION SYSTEM — Ready")
-print("  Simple questions only — no medical knowledge needed.\n")
+        st.markdown(f"""
+        <div style="padding:0 24px">
+        <div class="chips">
+          <span class="chip">📍 <b>{st.session_state.city}</b></span>
+          <span class="chip">🌡 <b>{res['temp']:.1f}°C</b> · {res['hum']}% humidity</span>
+          <span class="chip">📊 RAPID3 <b style="color:{r3col}">{r3:.1f}/30</b> · {r3name}</span>
+          <span class="chip">🤖 <b>{'ML Active' if MODELS_OK else 'Formula Mode'}</b></span>
+        </div>
+        </div>""", unsafe_allow_html=True)
 
-while True:
-    collect_and_predict()
-    again = input("\n  Assess another patient? (yes / no): ").strip().lower()
-    if again != 'yes':
-        print("\n  Thank you. Take care and stay well. 💙\n")
-        break
+        day_labels=["Today","Tomorrow","Day +2","Day +3"]
+        wxlist=[{"temp":res["temp"],"humidity":res["hum"],"desc":res["desc"]},
+                *[{"temp":f["temp"],"humidity":f["humidity"],"desc":f["desc"]} for f in fc]]
+        dates=[datetime.now().strftime("%d %b"),*[f["date"] for f in fc]]
+
+        fc_html=""
+        for i,(label,risk,w,date) in enumerate(zip(day_labels,risks,wxlist,dates)):
+            lvl=rlv(risk); col=rcl(risk); now="now" if i==0 else ""
+            emoji=rem(risk); lb=rlv(risk).replace("medium","moderate").title()
+            fc_html+=f"""
+            <div class="fc-box {now}">
+              <div class="fc-day">{label}</div>
+              <div style="font-size:0.58rem;color:var(--text3);margin-bottom:4px">{date}</div>
+              <div class="fc-pct" style="color:{col}">{risk:.0%}</div>
+              <div class="fc-badge {lvl}">{emoji} {lb}</div>
+              <div class="fc-wx">{w['temp']:.1f}°C · {w['humidity']}%<br>{w['desc']}</div>
+            </div>"""
+
+        st.markdown(f"""
+        <div style="padding:0 24px">
+        <div class="fc-row">{fc_html}</div>
+        </div>""", unsafe_allow_html=True)
+
+        fn_sc=res["fn_score"]; pain=res["pain"]; gs=res["gs"]; fat=res["fatigue"]
+        fnp=fn_sc/10*100; pp=pain/10*100; gp=gs/10*100; fp_=fat/10*100; r3p=r3/30*100
+
+        cats=[
+            ("≤3","Near Remission","#4ade80","#032010","#134e23",r3<=3),
+            ("4–6","Low","#60a5fa","#0d1a3d","#1e3a6b",3<r3<=6),
+            ("7–12","Moderate","#fbbf24","#3d1a00","#6b2d00",6<r3<=12),
+            (">12","High","#f87171","#2d0404","#6b0505",r3>12),
+        ]
+        cats_html="".join(f"""<div class="r3-cat" style="background:{bg};
+            border:{'2px' if active else '1px'} solid {bdr}">
+            <div class="r3-catlbl">{lbl}</div>
+            <div class="r3-catval" style="color:{col}">{val}</div>
+            </div>""" for val,lbl,col,bg,bdr,active in cats)
+
+        st.markdown(f"""
+        <div style="padding:0 24px">
+        <div class="r3-card">
+          <div class="qcard-hdr">RAPID3 Score Breakdown · Pincus et al. 2008</div>
+          <div class="r3-row">
+            <div class="r3-top"><span class="r3-lbl">Function Score A–J (HAQ-DI)</span><span class="r3-val">{fn_sc:.1f}/10</span></div>
+            <div class="r3-track"><div class="r3-fill" style="width:{fnp:.0f}%;background:#60a5fa"></div></div>
+          </div>
+          <div class="r3-row">
+            <div class="r3-top"><span class="r3-lbl">Pain VAS (Huskisson 1974)</span><span class="r3-val">{pain:.1f}/10</span></div>
+            <div class="r3-track"><div class="r3-fill" style="width:{pp:.0f}%;background:#f97316"></div></div>
+          </div>
+          <div class="r3-row">
+            <div class="r3-top"><span class="r3-lbl">Patient Global Estimate</span><span class="r3-val">{gs:.1f}/10</span></div>
+            <div class="r3-track"><div class="r3-fill" style="width:{gp:.0f}%;background:#a78bfa"></div></div>
+          </div>
+          <div class="r3-row" style="opacity:0.7">
+            <div class="r3-top"><span class="r3-lbl">Fatigue VAS (Wolfe 1996) — supplementary</span><span class="r3-val">{fat:.1f}/10</span></div>
+            <div class="r3-track"><div class="r3-fill" style="width:{fp_:.0f}%;background:#2dd4bf"></div></div>
+          </div>
+          <div class="r3-total">
+            <div class="r3-top">
+              <span style="font-weight:600;color:var(--text);font-size:0.75rem">Total RAPID3</span>
+              <span style="color:{r3col};font-size:0.88rem;font-weight:600">{r3:.1f}/30 · {r3name}</span>
+            </div>
+            <div class="r3-track" style="height:7px"><div class="r3-fill" style="width:{r3p:.0f}%;background:{r3col}"></div></div>
+          </div>
+          <div class="r3-cats">{cats_html}</div>
+        </div>
+        </div>""", unsafe_allow_html=True)
+
+        if plvl=="high":
+            title="🔴  High Flare Risk — Action Recommended"
+            items=[
+                "Contact your rheumatologist or doctor today — do not wait",
+                "Rest as much as possible — avoid heavy lifting",
+                "Take your prescribed medicines on time",
+                "Apply warm or cold packs to painful joints",
+                "Avoid going outside during peak midday heat (11am–3pm)",
+            ]
+            if res["hum"]>75 or any(f["humidity"]>75 for f in fc):
+                items.append(f"High humidity in {st.session_state.city} — stay indoors, use a fan or AC")
+        elif plvl=="medium":
+            title="🟡  Moderate Risk — Take Precautions"
+            items=[
+                "Aim for at least 7–8 hours of sleep tonight",
+                "Avoid stressful or physically demanding activities",
+                "Drink plenty of water — stay well hydrated",
+                "Gentle stretching only — no strenuous exercise",
+                "Call your doctor if pain suddenly worsens",
+            ]
+            if any(f["humidity"]>75 for f in fc):
+                items.append(f"Elevated humidity expected in {st.session_state.city} — take cool breaks")
+        else:
+            title="🟢  Low Risk — You Are Doing Well"
+            items=[
+                "Continue your current routine and medication schedule",
+                "Stay hydrated — drink water regularly",
+                "Light walking is good for your joints",
+                "Attend any planned appointments",
+            ]
+
+        adv_html="".join(f'<li><div class="adv-dot {plvl}"></div>{it}</li>' for it in items)
+        st.markdown(f"""
+        <div style="padding:0 24px">
+        <div class="adv {plvl}">
+          <div class="adv-hdr">{title}</div>
+          <ul>{adv_html}</ul>
+        </div>
+        <div class="disc">
+          ⚕️ &nbsp;<b>Clinical Decision Support Only.</b>
+          Based on RAPID3/MDHAQ (Pincus 2008), HAQ-DI (Fries 1980), VAS Pain (Huskisson 1974),
+          Fatigue VAS (Wolfe 1996), RADAI (Stucki 1995).
+          This tool does <b>not replace</b> evaluation by a qualified rheumatologist.
+        </div>
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
+        if st.button("← Start New Assessment", type="secondary"):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
