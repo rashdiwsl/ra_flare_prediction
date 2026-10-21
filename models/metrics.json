@@ -1,0 +1,142 @@
+{
+  "RA Clinical": {
+    "Logistic Regression": {
+      "acc": 0.6725978647686833,
+      "f1": 0.6926886215142444,
+      "auc": 0.7097494922139472,
+      "pr_auc": 0.4482264739577347,
+      "precision": 0.40350877192982454,
+      "recall": 0.6571428571428571,
+      "test_rows": 281,
+      "target": "dataset-defined future 3-day symptom-worsening proxy (flare_next_3d)",
+      "split": "grouped holdout by supplied ID"
+    },
+    "Random Forest": {
+      "acc": 0.7615658362989324,
+      "f1": 0.7061047029411907,
+      "auc": 0.6778605280974949,
+      "pr_auc": 0.44557477620822505,
+      "precision": 0.5789473684210527,
+      "recall": 0.15714285714285714,
+      "test_rows": 281,
+      "target": "dataset-defined future 3-day symptom-worsening proxy (flare_next_3d)",
+      "split": "grouped holdout by supplied ID"
+    },
+    "XGBoost": {
+      "acc": 0.6832740213523132,
+      "f1": 0.686835977285174,
+      "auc": 0.674272173324306,
+      "pr_auc": 0.43195162708048007,
+      "precision": 0.37333333333333335,
+      "recall": 0.4,
+      "test_rows": 281,
+      "target": "dataset-defined future 3-day symptom-worsening proxy (flare_next_3d)",
+      "split": "grouped holdout by supplied ID"
+    }
+  },
+  "Sleep Health": {
+    "Logistic Regression": {
+      "acc": 0.8933333333333333,
+      "f1": 0.894025974025974,
+      "auc": 0.9468475073313782,
+      "pr_auc": 0.9226316848031699,
+      "precision": 0.8285714285714286,
+      "recall": 0.9354838709677419,
+      "test_rows": 75,
+      "target": "sleep disorder present vs no disorder",
+      "split": "stratified random holdout"
+    },
+    "Random Forest": {
+      "acc": 0.9066666666666666,
+      "f1": 0.9071734539969835,
+      "auc": 0.9523460410557184,
+      "pr_auc": 0.9445526933307182,
+      "precision": 0.8529411764705882,
+      "recall": 0.9354838709677419,
+      "test_rows": 75,
+      "target": "sleep disorder present vs no disorder",
+      "split": "stratified random holdout"
+    },
+    "XGBoost": {
+      "acc": 0.9333333333333333,
+      "f1": 0.9334792920999818,
+      "auc": 0.9541788856304986,
+      "pr_auc": 0.9543075854139598,
+      "precision": 0.90625,
+      "recall": 0.9354838709677419,
+      "test_rows": 75,
+      "target": "sleep disorder present vs no disorder",
+      "split": "stratified random holdout"
+    }
+  },
+  "HRV Stress": {
+    "Logistic Regression": {
+      "acc": 0.6856400119147553,
+      "f1": 0.683172669452516,
+      "auc": 0.7483478027792503,
+      "pr_auc": 0.721220341636271,
+      "precision": 0.6785318140566704,
+      "recall": 0.5965249253863657,
+      "test_rows": 73858,
+      "target": "condition != 'no stress'; row-level split, no verified subject/session IDs",
+      "split": "stratified random holdout"
+    },
+    "Random Forest": {
+      "acc": 1.0,
+      "f1": 1.0,
+      "auc": 1.0,
+      "pr_auc": 1.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "test_rows": 73858,
+      "target": "condition != 'no stress'; row-level split, no verified subject/session IDs",
+      "split": "stratified random holdout"
+    },
+    "XGBoost": {
+      "acc": 0.9598553981965393,
+      "f1": 0.9598612652319877,
+      "auc": 0.9942209466121545,
+      "pr_auc": 0.9932208766591671,
+      "precision": 0.954433062522077,
+      "recall": 0.9581277149020418,
+      "test_rows": 73858,
+      "target": "condition != 'no stress'; row-level split, no verified subject/session IDs",
+      "split": "stratified random holdout"
+    }
+  },
+  "Sri Lankan RA": {
+    "Logistic Regression": {
+      "acc": 0.5,
+      "f1": 0.375,
+      "auc": 0.6349206349206349,
+      "pr_auc": 0.5773268398268399,
+      "precision": 0.0,
+      "recall": 0.0,
+      "test_rows": 16,
+      "target": "cDAI(9) > cohort median (6.000); not confirmed flare",
+      "split": "stratified random holdout"
+    },
+    "Random Forest": {
+      "acc": 0.6875,
+      "f1": 0.6837044534412955,
+      "auc": 0.5873015873015873,
+      "pr_auc": 0.5665834165834167,
+      "precision": 0.6666666666666666,
+      "recall": 0.5714285714285714,
+      "test_rows": 16,
+      "target": "cDAI(9) > cohort median (6.000); not confirmed flare",
+      "split": "stratified random holdout"
+    },
+    "XGBoost": {
+      "acc": 0.5,
+      "f1": 0.5,
+      "auc": 0.4761904761904762,
+      "pr_auc": 0.4372706658420944,
+      "precision": 0.4444444444444444,
+      "recall": 0.5714285714285714,
+      "test_rows": 16,
+      "target": "cDAI(9) > cohort median (6.000); not confirmed flare",
+      "split": "stratified random holdout"
+    }
+  }
+}
