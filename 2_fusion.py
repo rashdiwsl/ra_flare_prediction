@@ -37,6 +37,7 @@ import os
 import secrets
 import sqlite3
 import warnings
+import zlib
 from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -57,7 +58,7 @@ except Exception:  # pragma: no cover - joblib should normally be installed
 # ─────────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
-DB_PATH = os.path.join(BASE_DIR, "flareguard.db")
+DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "flareguard.db"))
 METRICS_PATH = os.path.join(MODELS_DIR, "metrics.json")
 FEEDBACK_PATH = os.path.join(BASE_DIR, "patient_feedback.csv")
 
@@ -180,7 +181,7 @@ class WeatherClient:
             except (requests.RequestException, ValueError, KeyError, TypeError, OSError):
                 pass  # fall through to the synthetic trend below
 
-        rng = np.random.default_rng(abs(hash(city)) % (2**32))
+        rng = np.random.default_rng(zlib.crc32(city.encode("utf-8")))
         out = []
         for i in range(days):
             out.append(WeatherReading(
@@ -291,18 +292,17 @@ def load_models(models_dir: str = MODELS_DIR) -> ModelBundle:
 
 
 def safe_predict_proba(model, inputs) -> float:
-    """Pads/truncates `inputs` to whatever the model expects and always
-    returns a clean float probability in [0, 1] — falling back to a neutral
-    0.5 only if the model itself raises despite the guards above."""
+    """Strict probability helper. Feature padding/truncation is prohibited:
+    silently changing a model's feature contract can produce meaningless scores."""
     try:
-        n = int(getattr(model, "n_features_in_", len(inputs)))
-        arr = np.array(inputs, dtype=float)
-        if len(arr) < n:
-            arr = np.pad(arr, (0, n - len(arr)))
-        else:
-            arr = arr[:n]
-        proba = model.predict_proba([arr])[0]
-        return float(np.clip(proba[1], 0, 1))
+        arr = np.asarray(inputs, dtype=float).reshape(1, -1)
+        expected = getattr(model, "n_features_in_", None)
+        if expected is not None and arr.shape[1] != int(expected):
+            raise ValueError(f"Feature mismatch: received {arr.shape[1]}, expected {expected}")
+        proba = model.predict_proba(arr)[0]
+        classes = list(getattr(model, "classes_", [0, 1]))
+        positive_index = classes.index(1) if 1 in classes else len(classes) - 1
+        return float(np.clip(proba[positive_index], 0, 1))
     except Exception:
         return 0.5
 
@@ -402,59 +402,52 @@ def _submodel_inputs(x: RiskInputs):
 
 
 def compute_risk(x: RiskInputs, models: ModelBundle):
-    """Returns (risk in [0,1], contributions dict) where `contributions` is
-    a transparent, additive decomposition used to drive the Step-7 XAI chart
-    — every entry is on the same 0-1-weighted scale so the bars are directly
-    comparable."""
-    ra_in, slra_in, sleep_in, hrv_in = _submodel_inputs(x)
+    """Return an experimental heuristic score and additive display components.
 
-    clinical_score = (
-        _norm(x.fn_score, 0, 10) * 0.25
-        + _norm(x.pain, 0, 10) * 0.25
-        + _norm(x.global_estimate, 0, 10) * 0.20
-        + _norm(x.flares_30d, 0, 30) * 0.15
-        + _norm(x.fatigue, 0, 10) * 0.10
-        + (1 - _norm(max(0, 8 - x.sleep_diff * 1.8), 0, 12)) * 0.05
-    )
-
-    p_ra = safe_predict_proba(models.ra, ra_in)
-    p_slra = safe_predict_proba(models.sl_ra, slra_in)
-    p_sleep = safe_predict_proba(models.sleep, sleep_in)
-    p_hrv = safe_predict_proba(models.hrv, hrv_in)
-    model_score = safe_predict_proba(models.meta, [p_ra, p_sleep, p_hrv, p_slra])
-
-    humidity_term = _norm(x.humidity, 40, 100) * 0.15
-    temp_term = _norm(max(0, 32 - x.temp), 0, 20) * 0.05
-
-    risk = clinical_score * 0.65 + model_score * 0.15 + humidity_term * 0.15 + temp_term * 0.05
-
-    if x.humidity > 85:
-        risk = min(1, risk + 0.06)
-    elif x.humidity > 80:
-        risk = min(1, risk + 0.03)
-    elif x.humidity > 75:
-        risk = min(1, risk + 0.01)
-    if x.rapid3 > 12:
-        risk = min(1, risk + 0.08)
-    elif x.rapid3 > 6:
-        risk = min(1, risk + 0.04)
-    if x.pain >= 7 and x.sleep_diff >= 2:
-        risk = min(1, risk + 0.05)
-    if x.rapid3 <= 3 and x.flares_30d <= 2:
-        risk = min(risk, 0.25)
-
-    contributions = {
+    IMPORTANT: This is NOT a calibrated flare probability. The available
+    dataset models have incompatible targets and feature schemas; therefore
+    no trained model prediction is mixed into this score. The clinical and
+    environmental weights are normalised to sum to one (0.65 + 0.15 + 0.05
+    = 0.85 before normalisation). A future fusion model must be independently
+    trained, calibrated, and evaluated before it is connected here.
+    """
+    clinical_components = {
         "Pain VAS": _norm(x.pain, 0, 10) * 0.25,
         "Function Score (HAQ-DI)": _norm(x.fn_score, 0, 10) * 0.25,
         "Patient Global Estimate": _norm(x.global_estimate, 0, 10) * 0.20,
         "Flare History (30d)": _norm(x.flares_30d, 0, 30) * 0.15,
         "Sleep Difficulty": (1 - _norm(max(0, 8 - x.sleep_diff * 1.8), 0, 12)) * 0.05,
         "Fatigue VAS": _norm(x.fatigue, 0, 10) * 0.10,
-        "Humidity": humidity_term,
-        "Temperature": temp_term,
-        "ML Fusion Signal (RA+Sleep+HRV+SL-RA)": model_score * 0.15,
     }
-    return _clip01(risk), contributions
+    clinical_score = float(sum(clinical_components.values()))
+    humidity_raw = _norm(x.humidity, 40, 100) * 0.15
+    temp_raw = _norm(max(0, 32 - x.temp), 0, 20) * 0.05
+
+    # Normalise the stated 65% clinical + 15% humidity + 5% temperature
+    # heuristic so the score remains in [0,1] without pretending missing
+    # ML weight is real evidence.
+    denominator = 0.85
+    score = (clinical_score * 0.65 + humidity_raw + temp_raw) / denominator
+
+    if x.humidity > 85:
+        score = min(1, score + 0.04)
+    elif x.humidity > 80:
+        score = min(1, score + 0.02)
+    elif x.humidity > 75:
+        score = min(1, score + 0.01)
+    if x.rapid3 > 12:
+        score = min(1, score + 0.05)
+    elif x.rapid3 > 6:
+        score = min(1, score + 0.025)
+    if x.pain >= 7 and x.sleep_diff >= 2:
+        score = min(1, score + 0.03)
+    if x.rapid3 <= 3 and x.flares_30d <= 2:
+        score = min(score, 0.25)
+
+    contributions = {k: v * 0.65 / denominator for k, v in clinical_components.items()}
+    contributions["Humidity (heuristic)" ] = humidity_raw / denominator
+    contributions["Temperature (heuristic)"] = temp_raw / denominator
+    return _clip01(score), contributions
 
 
 def project_forward(pain, fatigue, sleep_diff, anxiety, flares_30d, day_offset):
@@ -490,39 +483,11 @@ def risk_emoji(r: float) -> str:
 # 5. MODEL PERFORMANCE METRICS (viva "Model Performance" tab)
 # ═════════════════════════════════════════════════════════════════════════
 
-# Reference figures shown ONLY when models/metrics.json (written by
-# 1_train_models_v2.py after a real cross-validated comparison) is not
-# present — clearly labelled "Demo / Reference" in the UI so a viva panel
-# never mistakes them for a live evaluation on this machine.
-_DEMO_METRICS = {
-    "RA Clinical": {
-        "Logistic Regression": {"acc": 0.78, "f1": 0.77, "auc": 0.83},
-        "Random Forest": {"acc": 0.84, "f1": 0.83, "auc": 0.89},
-        "XGBoost": {"acc": 0.86, "f1": 0.85, "auc": 0.91},
-    },
-    "Sleep Health": {
-        "Logistic Regression": {"acc": 0.74, "f1": 0.73, "auc": 0.80},
-        "Random Forest": {"acc": 0.81, "f1": 0.80, "auc": 0.87},
-        "XGBoost": {"acc": 0.83, "f1": 0.82, "auc": 0.88},
-    },
-    "HRV Stress": {
-        "Logistic Regression": {"acc": 0.71, "f1": 0.70, "auc": 0.77},
-        "Random Forest": {"acc": 0.79, "f1": 0.78, "auc": 0.85},
-        "XGBoost": {"acc": 0.82, "f1": 0.81, "auc": 0.87},
-    },
-    "Sri Lankan RA": {
-        "Logistic Regression": {"acc": 0.72, "f1": 0.71, "auc": 0.78},
-        "Random Forest": {"acc": 0.80, "f1": 0.79, "auc": 0.86},
-        "XGBoost": {"acc": 0.83, "f1": 0.82, "auc": 0.88},
-    },
-}
-
-
 def get_model_metrics(path: str = METRICS_PATH):
     """Returns (metrics_dict, is_live). `is_live=True` only when a real
     models/metrics.json produced by the training pipeline was found and
-    parsed successfully; otherwise the labelled reference figures above are
-    returned with is_live=False."""
+    parsed successfully; otherwise ({}, False) is returned. There are no
+    hard-coded fallback figures: if the file is missing the UI says so."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -530,7 +495,7 @@ def get_model_metrics(path: str = METRICS_PATH):
             return data, True
     except Exception:
         pass
-    return _DEMO_METRICS, False
+    return {}, False
 
 
 def save_metrics(summary: dict, path: str = METRICS_PATH) -> bool:
