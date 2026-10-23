@@ -6,18 +6,15 @@ Keeping this framework-agnostic means it can also be unit-tested or reused
 headlessly (e.g. from a notebook or a CLI) without pulling in Streamlit.
 
 Responsibilities:
-  1. Weather retrieval (OpenWeatherMap) with a strict try/except and a
-     realistic Sri Lankan offline fallback dataset.
-  2. ML model loading (.pkl / .joblib) with per-model error isolation and a
-     calibrated formula-based fallback so a missing/corrupt model file never
-     crashes the app or silently returns nonsense.
-  3. Clinical score calculators — RAPID3 / HAQ-DI / MDHAQ / Pain VAS.
-  4. The fused multimodal flare-risk engine, plus an explainability (XAI)
-     breakdown of what drove each prediction.
-  5. Cross-validated model performance metrics for the "Model Performance"
-     viva tab (loaded from models/metrics.json when the training pipeline
-     has produced one, otherwise clearly-labelled reference figures).
-  6. A lightweight SQLite-backed authentication & assessment-history store.
+  1. Weather context retrieval with a fallback for legacy interface use.
+  2. Legacy model-loading helpers for the old Streamlit console. The fallback
+     scores in this module are not calibrated predictions.
+  3. Legacy score calculators retained for backwards compatibility. The React
+     API uses project-specific questionnaire summary functions instead.
+  4. Legacy heuristic risk functions retained for the old Streamlit console;
+     they are not a trained or validated multimodal flare predictor and are
+     not called by the React/FastAPI patient assessment endpoint.
+  5. Historical dataset metrics and account/history helper functions.
 
 Reference standards implemented here:
   RAPID3      Pincus et al., J Rheumatol 2008;35:2136
@@ -33,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -45,6 +43,18 @@ from typing import Optional
 
 import numpy as np
 import requests
+from database import connect as connect_database, execute as execute_sql
+from database import INTEGRITY_ERRORS
+
+LOG = logging.getLogger(__name__)
+
+# Load optional local environment variables from a .env file beside this file.
+# The app still works without python-dotenv or a .env file; in that case,
+# OWM_API_KEY can be supplied through the operating system environment.
+try:
+    from dotenv import load_dotenv
+except ImportError:  # python-dotenv is optional
+    load_dotenv = None
 
 warnings.filterwarnings("ignore")
 
@@ -57,6 +67,9 @@ except Exception:  # pragma: no cover - joblib should normally be installed
 # Paths & config
 # ─────────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if load_dotenv is not None:
+    load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DB_PATH = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "flareguard.db"))
 METRICS_PATH = os.path.join(MODELS_DIR, "metrics.json")
@@ -199,13 +212,12 @@ class WeatherClient:
 # ═════════════════════════════════════════════════════════════════════════
 
 class CalibratedFallbackModel:
-    """Drop-in stand-in for a scikit-learn classifier, used whenever a real
-    .pkl/.joblib file fails to load or deserialize. Rather than crashing or
-    returning a meaningless constant, it produces a bounded, monotonically
-    sensible pseudo-probability from a weighted combination of the raw
-    inputs — the same clinically-motivated fields the real model expects —
-    so the app degrades gracefully and the panel can see *why* a number was
-    produced even when a model artefact is missing."""
+    """Legacy compatibility stand-in for the old Streamlit model panel.
+
+    It generates a formula-based pseudo-score, not a trained prediction and
+    not a calibrated probability. The React/FastAPI patient assessment does
+    not use this fallback. Do not report its outputs as model performance.
+    """
 
     def __init__(self, name: str, n_features: int, weights: Optional[list] = None):
         self.name = name
@@ -328,14 +340,37 @@ DIFFICULTY_SHORT = {0: "0 · None", 1: "1 · Some", 2: "2 · Much", 3: "3 · Una
 DIFFICULTY_COLORS = {0: "#4ade80", 1: "#facc15", 2: "#fb923c", 3: "#f87171"}
 
 
+def rapid3_function_score(fn_vals: dict) -> float:
+    """Return the ten-item RAPID3 function component on a 0-10 scale.
+
+    This is not the official HAQ-DI score. The ten selected function items
+    are summed (0-30) and divided by 3 to obtain the RAPID3 function component.
+    """
+    return round(sum(fn_vals.values()) / 3, 2)
+
+
+def prototype_function_score(fn_vals: dict) -> float:
+    """Score the prototype's ten selected function items on a 0–10 scale.
+
+    This is a project-specific calculation and is not an official HAQ-DI or
+    RAPID3 score unless the exact licensed instrument and protocol are verified.
+    """
+    return round(sum(float(v) for v in fn_vals.values()) / 3, 2)
+
+
+def prototype_questionnaire_score(fn_vals: dict, pain: float, global_estimate: float) -> float:
+    """Project-specific function + pain + global summary on a nominal 0–30 scale."""
+    return round(prototype_function_score(fn_vals) + float(pain) + float(global_estimate), 2)
+
+
 def haq_di_score(fn_vals: dict) -> float:
-    """HAQ-DI-derived Function score (0-10), the FN component of RAPID3."""
-    return round(sum(fn_vals.values()) / 3, 1)
+    """Backward-compatible legacy name; do not label this as official HAQ-DI."""
+    return rapid3_function_score(fn_vals)
 
 
 def rapid3_total(fn_vals: dict, pain: float, global_estimate: float) -> float:
-    """RAPID3 = FN(raw 0-30, unscaled) + Pain VAS(0-10) + Patient Global(0-10)."""
-    return sum(fn_vals.values()) + pain + global_estimate
+    """RAPID3 total: function (0-10) + pain VAS (0-10) + patient global (0-10)."""
+    return rapid3_function_score(fn_vals) + float(pain) + float(global_estimate)
 
 
 def rapid3_category(score: float):
@@ -413,7 +448,7 @@ def compute_risk(x: RiskInputs, models: ModelBundle):
     """
     clinical_components = {
         "Pain VAS": _norm(x.pain, 0, 10) * 0.25,
-        "Function Score (HAQ-DI)": _norm(x.fn_score, 0, 10) * 0.25,
+        "RAPID3 Function Component": _norm(x.fn_score, 0, 10) * 0.25,
         "Patient Global Estimate": _norm(x.global_estimate, 0, 10) * 0.20,
         "Flare History (30d)": _norm(x.flares_30d, 0, 30) * 0.15,
         "Sleep Difficulty": (1 - _norm(max(0, 8 - x.sleep_diff * 1.8), 0, 12)) * 0.05,
@@ -516,15 +551,14 @@ def save_metrics(summary: dict, path: str = METRICS_PATH) -> bool:
 # 6. AUTHENTICATION & ASSESSMENT HISTORY (SQLite)
 # ═════════════════════════════════════════════════════════════════════════
 
-def _connect(db_path: str = DB_PATH):
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def _connect(db_path: Optional[str] = None):
+    # DATABASE_URL selects persistent PostgreSQL in hosting; otherwise SQLite.
+    return connect_database(db_path or DB_PATH)
 
 
 def init_db(db_path: str = DB_PATH) -> None:
-    with closing(sqlite3.connect(db_path)) as conn, conn:
-        conn.execute("""
+    with closing(_connect(db_path)) as conn, conn:
+        execute_sql(conn, """
             CREATE TABLE IF NOT EXISTS users (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 username     TEXT UNIQUE NOT NULL,
@@ -534,7 +568,7 @@ def init_db(db_path: str = DB_PATH) -> None:
                 created_at   TEXT NOT NULL
             )
         """)
-        conn.execute("""
+        execute_sql(conn, """
             CREATE TABLE IF NOT EXISTS assessments (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 username        TEXT NOT NULL,
@@ -567,14 +601,15 @@ def create_user(username: str, password: str, display_name: str = "") -> tuple[b
     salt, pw_hash = _hash_password(password)
     try:
         with closing(_connect()) as conn, conn:
-            conn.execute(
+            execute_sql(conn,
                 "INSERT INTO users (username, salt, pw_hash, display_name, created_at) VALUES (?,?,?,?,?)",
                 (username, salt, pw_hash, (display_name or username).strip(), datetime.now().isoformat()),
             )
         return True, "Account created — you can now log in."
-    except sqlite3.IntegrityError:
-        return False, "That username is already taken."
     except Exception as exc:
+        from database import INTEGRITY_ERRORS
+        if isinstance(exc, INTEGRITY_ERRORS):
+            return False, "That username is already taken."
         return False, f"Could not create account ({exc.__class__.__name__})."
 
 
@@ -582,7 +617,7 @@ def verify_user(username: str, password: str) -> tuple[bool, str]:
     username = (username or "").strip().lower()
     try:
         with closing(_connect()) as conn:
-            row = conn.execute(
+            row = execute_sql(conn,
                 "SELECT salt, pw_hash, display_name FROM users WHERE username = ?", (username,)
             ).fetchone()
         if not row:
@@ -597,10 +632,10 @@ def verify_user(username: str, password: str) -> tuple[bool, str]:
 
 
 def save_assessment(username: str, city: str, rapid3: float, fn_score: float, pain: float,
-                     global_estimate: float, peak_risk: float, level: str) -> bool:
+                     global_estimate: float, peak_risk: Optional[float], level: Optional[str]) -> bool:
     try:
         with closing(_connect()) as conn, conn:
-            conn.execute(
+            execute_sql(conn,
                 """INSERT INTO assessments
                    (username, created_at, city, rapid3, fn_score, pain, global_estimate, peak_risk, risk_level)
                    VALUES (?,?,?,?,?,?,?,?,?)""",
@@ -612,17 +647,28 @@ def save_assessment(username: str, city: str, rapid3: float, fn_score: float, pa
         return False
 
 
-def get_history(username: str, limit: int = 10):
-    """Returns most-recent-first list of (created_at, city, rapid3, peak_risk, risk_level)."""
+
+def get_history(username: str, limit: int | None = None):
+    """Return recent-first account history; optionally limit the number of records."""
     try:
         with closing(_connect()) as conn:
-            rows = conn.execute(
-                """SELECT created_at, city, rapid3, peak_risk, risk_level FROM assessments
-                   WHERE username = ? ORDER BY created_at DESC LIMIT ?""",
-                ((username or "guest").strip().lower(), limit),
-            ).fetchall()
+            query = """
+                SELECT created_at, city, rapid3, peak_risk, risk_level
+                FROM assessments
+                WHERE username = ?
+                ORDER BY created_at DESC
+            """
+            params = [(username or "guest").strip().lower()]
+
+            if limit is not None:
+                limit = max(1, int(limit))
+                query += " LIMIT ?"
+                params.append(limit)
+
+            rows = execute_sql(conn, query, tuple(params)).fetchall()
         return rows
     except Exception:
+        LOG.exception("Failed to retrieve assessment history")
         return []
 
 

@@ -1,10 +1,15 @@
 
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import {
   getCurrentUser,
+  getAssessmentHistory,
   login,
   logout,
   register,
+  submitAssessment as sendAssessment,
+  submitGuestAssessment,
+  type AssessmentData,
+  type AssessmentResult,
   type AuthUser,
 } from './services/api'
 import './App.css'
@@ -19,15 +24,6 @@ const navigation: { label: Page; icon: string }[] = [
   { label: 'Forecast History', icon: '▤' },
 ]
 
-const symptomData = [
-  { day: 'Mon', pain: 4, fatigue: 5 },
-  { day: 'Tue', pain: 3, fatigue: 4 },
-  { day: 'Wed', pain: 5, fatigue: 6 },
-  { day: 'Thu', pain: 4, fatigue: 5 },
-  { day: 'Fri', pain: 6, fatigue: 7 },
-  { day: 'Sat', pain: 3, fatigue: 4 },
-  { day: 'Sun', pain: 4, fatigue: 3 },
-]
 
 function AuthScreen({
   onAuthenticated,
@@ -310,6 +306,33 @@ function App() {
   const [authError, setAuthError] = useState('')
   const [activePage, setActivePage] = useState<Page>('Overview')
   const [loggingOut, setLoggingOut] = useState(false)
+  const [latestAssessment, setLatestAssessment] = useState<AssessmentResult | null>(null)
+  const [historyItems, setHistoryItems] = useState<import('./services/api').HistoryItem[]>([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState('')
+
+  const loadAssessmentHistory = useCallback(async () => {
+    if (isGuest || !user) {
+      setHistoryItems([])
+      setHistoryError('')
+      setHistoryLoading(false)
+      return
+    }
+
+    setHistoryLoading(true)
+    setHistoryError('')
+
+    try {
+      const response = await getAssessmentHistory()
+      setHistoryItems(response.assessments)
+    } catch (err) {
+      setHistoryError(
+        err instanceof Error ? err.message : 'Unable to load assessment history.',
+      )
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [isGuest, user])
 
   useEffect(() => {
     let cancelled = false
@@ -335,6 +358,40 @@ function App() {
       cancelled = true
     }
   }, [])
+
+  useEffect(() => {
+    if (checkingSession || !user || isGuest) {
+      return
+    }
+
+    let cancelled = false
+
+    getAssessmentHistory()
+      .then((response) => {
+        if (!cancelled) {
+          setHistoryItems(response.assessments)
+          setHistoryError('')
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setHistoryError(
+            err instanceof Error
+              ? err.message
+              : 'Unable to load assessment history.',
+          )
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setHistoryLoading(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [user, isGuest, checkingSession])
 
   async function handleLogout() {
     setLoggingOut(true)
@@ -494,7 +551,7 @@ function App() {
 
           <div className="topbar-right">
             <span className="demo-badge">
-              <span /> DEMO DATA
+              <span /> {isGuest ? 'GUEST SESSION' : 'RESEARCH PROTOTYPE'}
             </span>
             <div className="top-avatar">{avatarLetter}</div>
           </div>
@@ -506,8 +563,7 @@ function App() {
               <div>
                 <strong>You are exploring as a guest.</strong>
                 <p>
-                  The information shown is illustrative demo data.
-                  Assessment entries are not saved permanently.
+                  Your submitted assessment is calculated by the research prototype. Guest results stay in this browser session and are not saved to an account.
                 </p>
               </div>
 
@@ -546,307 +602,126 @@ function App() {
           <div className="notice">
             <span className="notice-icon">ⓘ</span>
             <p>
-              <strong>Demonstration interface.</strong> All patient
-              values below are illustrative, not real patient records
-              or validated clinical predictions.
+              <strong>Research prototype.</strong> Only values from assessments you submit are shown here. Scores are experimental and are not clinically validated flare probabilities.
             </p>
           </div>
 
           {activePage === 'Overview' && (
-            <>
-              <section className="section-heading">
-                <div>
-                  <h2>Your week at a glance</h2>
-                  <p>
-                    A simple overview of your recent symptom check-ins.
-                  </p>
-                </div>
-                <span className="period-label">
-                  ILLUSTRATIVE · 7 DAYS
-                </span>
-              </section>
-
-              <div className="stats-grid">
-                <article className="stat-card">
-                  <div className="stat-top">
-                    <span className="stat-icon mint">◷</span>
-                    <span className="stat-label">PAIN LEVEL</span>
-                  </div>
-                  <div className="stat-value">
-                    4.1 <span>/ 10</span>
-                  </div>
-                  <p className="stat-foot">
-                    <span className="neutral-pill">Demo value</span>
-                    Average this week
-                  </p>
-                  <div className="mini-bars pain-bars">
-                    {[35, 25, 50, 40, 65, 30, 40].map(
-                      (height, index) => (
-                        <i
-                          key={index}
-                          style={{ height: `${height}%` }}
-                        />
-                      ),
-                    )}
-                  </div>
-                </article>
-
-                <article className="stat-card">
-                  <div className="stat-top">
-                    <span className="stat-icon lavender">☼</span>
-                    <span className="stat-label">FATIGUE</span>
-                  </div>
-                  <div className="stat-value">
-                    4.9 <span>/ 10</span>
-                  </div>
-                  <p className="stat-foot">
-                    <span className="neutral-pill">Demo value</span>
-                    Average this week
-                  </p>
-                  <div className="mini-bars fatigue-bars">
-                    {[45, 35, 60, 48, 75, 38, 28].map(
-                      (height, index) => (
-                        <i
-                          key={index}
-                          style={{ height: `${height}%` }}
-                        />
-                      ),
-                    )}
-                  </div>
-                </article>
-
-                <article className="stat-card">
-                  <div className="stat-top">
-                    <span className="stat-icon peach">☾</span>
-                    <span className="stat-label">SLEEP QUALITY</span>
-                  </div>
-                  <div className="stat-value">
-                    6.5 <span>/ 10</span>
-                  </div>
-                  <p className="stat-foot">
-                    <span className="neutral-pill">Demo value</span>
-                    Average this week
-                  </p>
-                  <div className="sleep-progress">
-                    <span />
-                  </div>
-                  <p className="progress-caption">
-                    Illustrative sleep rating
-                  </p>
-                </article>
-
-                <article className="stat-card checkin-card">
-                  <div className="stat-top">
-                    <span className="stat-icon blue">✓</span>
-                    <span className="stat-label">CHECK-INS</span>
-                  </div>
-                  <div className="stat-value">
-                    7 <span>days</span>
-                  </div>
-                  <p className="stat-foot">
-                    Example tracking streak
-                  </p>
-                  <div className="checkin-days">
-                    {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map(
-                      (day, index) => (
-                        <span key={index}>{day}</span>
-                      ),
-                    )}
-                  </div>
-                </article>
-              </div>
-
-              <div className="content-grid">
-                <section className="panel trend-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <h2>Symptom patterns</h2>
-                      <p>
-                        Illustrative daily ratings on a 0–10 scale
-                      </p>
-                    </div>
-                    <span className="chart-tag">Last 7 days</span>
-                  </div>
-
-                  <div className="chart-legend">
-                    <span>
-                      <i className="legend-pain" /> Pain
-                    </span>
-                    <span>
-                      <i className="legend-fatigue" /> Fatigue
-                    </span>
-                  </div>
-
-                  <div className="chart">
-                    <div className="y-labels">
-                      <span>10</span>
-                      <span>8</span>
-                      <span>6</span>
-                      <span>4</span>
-                      <span>2</span>
-                      <span>0</span>
-                    </div>
-
-                    <div className="chart-area">
-                      {[0, 1, 2, 3, 4, 5].map((line) => (
-                        <div className="grid-line" key={line} />
-                      ))}
-
-                      <svg
-                        viewBox="0 0 700 200"
-                        preserveAspectRatio="none"
-                        role="img"
-                        aria-label="Illustrative pain and fatigue trends over seven days"
-                      >
-                        <polyline
-                          points={symptomData
-                            .map(
-                              (day, index) =>
-                                `${index * 116 + 8},${200 - day.pain * 18}`,
-                            )
-                            .join(' ')}
-                          className="pain-line"
-                        />
-
-                        <polyline
-                          points={symptomData
-                            .map(
-                              (day, index) =>
-                                `${index * 116 + 8},${200 - day.fatigue * 18}`,
-                            )
-                            .join(' ')}
-                          className="fatigue-line"
-                        />
-
-                        {symptomData.map((day, index) => (
-                          <circle
-                            key={`pain-${day.day}`}
-                            cx={index * 116 + 8}
-                            cy={200 - day.pain * 18}
-                            r="4"
-                            className="pain-point"
-                          />
-                        ))}
-
-                        {symptomData.map((day, index) => (
-                          <circle
-                            key={`fatigue-${day.day}`}
-                            cx={index * 116 + 8}
-                            cy={200 - day.fatigue * 18}
-                            r="4"
-                            className="fatigue-point"
-                          />
-                        ))}
-                      </svg>
-
-                      <div className="x-labels">
-                        {symptomData.map((day) => (
-                          <span key={day.day}>{day.day}</span>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-
-                  <p className="chart-note">
-                    Example data only. This chart does not represent a
-                    real person's health.
-                  </p>
-                </section>
-
-                <section className="panel checkin-panel">
-                  <div className="panel-heading">
-                    <div>
-                      <h2>Daily check-in</h2>
-                      <p>Take a moment for yourself</p>
-                    </div>
-                    <span className="checkin-spark">✧</span>
-                  </div>
-
-                  <div className="checkin-illustration">
-                    <span>♡</span>
-                    <div>
-                      <i />
-                      <i />
-                      <i />
-                    </div>
-                  </div>
-
-                  <h3>How are you feeling today?</h3>
-                  <p className="checkin-description">
-                    Your experience matters. Record how you feel to
-                    build a personal symptom history.
-                  </p>
-
-                  <button
-                    type="button"
-                    className="primary-button full-button"
-                    onClick={() => setActivePage('Assessment')}
-                  >
-                    Start a check-in <span>→</span>
-                  </button>
-
-                  <p className="time-hint">
-                    Usually takes 2–3 minutes
-                  </p>
-                </section>
-              </div>
-
-              <section className="panel recent-panel">
-                <div className="panel-heading">
-                  <div>
-                    <h2>Recent activity</h2>
-                    <p>Example entries for the demonstration</p>
-                  </div>
-                  <button
-                    type="button"
-                    className="text-button"
-                    onClick={() => setActivePage('My Symptoms')}
-                  >
-                    View symptom history →
+            <section className="panel secondary-page">
+              <h2>Your assessment overview</h2>
+              {!latestAssessment ? (
+                <div className="empty-state">
+                  <h3>No assessment yet</h3>
+                  <p>Complete an assessment to see the result calculated from your answers. No sample health values are displayed.</p>
+                  <button type="button" className="primary-button" onClick={() => setActivePage('Assessment')}>
+                    Start assessment →
                   </button>
                 </div>
-
-                <div className="activity-row">
-                  <span className="activity-icon mint">✓</span>
-                  <div className="activity-main">
-                    <strong>Symptom check-in recorded</strong>
-                    <small>Illustrative entry · Monday</small>
+              ) : (
+                <>
+                  <p>Latest assessment · {new Date(latestAssessment.assessment.created_at).toLocaleString()}</p>
+                  <div className="stats-grid">
+                    <article className="stat-card">
+                      <div className="stat-label">RAPID3 SCORE</div>
+                      <div className="stat-value">{latestAssessment.assessment.rapid3.toFixed(1)}</div>
+                      <p>{latestAssessment.assessment.rapid3_category}</p>
+                    </article>
+                    <article className="stat-card">
+                      <div className="stat-label">EXPERIMENTAL SCORE</div>
+                      <div className="stat-value">{(latestAssessment.assessment.experimental_score * 100).toFixed(1)}<span>%</span></div>
+                      <p>{latestAssessment.assessment.risk_label}</p>
+                    </article>
+                    <article className="stat-card">
+                      <div className="stat-label">PAIN LEVEL</div>
+                      <div className="stat-value">{latestAssessment.assessment.pain}<span>/10</span></div>
+                      <p>Reported by you</p>
+                    </article>
+                    <article className="stat-card">
+                      <div className="stat-label">FUNCTION SCORE</div>
+                      <div className="stat-value">{latestAssessment.assessment.function_score.toFixed(1)}</div>
+                      <p>Calculated from function responses</p>
+                    </article>
                   </div>
-                  <span className="activity-value">Pain: 4/10</span>
-                </div>
-
-                <div className="activity-row">
-                  <span className="activity-icon lavender">☾</span>
-                  <div className="activity-main">
-                    <strong>Sleep rating recorded</strong>
-                    <small>Illustrative entry · Sunday</small>
-                  </div>
-                  <span className="activity-value">Sleep: 6/10</span>
-                </div>
-              </section>
-            </>
+                  <p className="chart-note">Experimental score is a heuristic output, not a validated probability of an RA flare. This prototype does not provide medical advice.</p>
+                  <button type="button" className="primary-button" onClick={() => setActivePage('Assessment')}>Complete another assessment →</button>
+                </>
+              )}
+            </section>
           )}
 
           {activePage === 'My Symptoms' && (
             <section className="panel secondary-page">
               <h2>Symptom history</h2>
-              <p>
-                Example symptom ratings. Real history will appear after
-                a connected, persistent data source is implemented.
-              </p>
+              {isGuest ? (
+                <>
+                  <p>Guest assessments are temporary and are not saved as account history.</p>
+                  {latestAssessment ? (
+                    <div className="history-row">
+                      <strong>{new Date(latestAssessment.assessment.created_at).toLocaleString()}</strong>
+                      <span>Pain: {latestAssessment.assessment.pain}/10</span>
+                      <span>RAPID3: {latestAssessment.assessment.rapid3.toFixed(1)}</span>
+                    </div>
+                  ) : (
+                    <div className="empty-state">Complete an assessment to see its result here.</div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p>Your saved assessments, newest first.</p>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => void loadAssessmentHistory()}
+                    disabled={historyLoading}
+                  >
+                    {historyLoading ? 'Refreshing?' : 'Refresh history'}
+                  </button>
 
-              {symptomData.map((day) => (
-                <div className="history-row" key={day.day}>
-                  <strong>{day.day}</strong>
-                  <span>Pain: {day.pain}/10</span>
-                  <span>Fatigue: {day.fatigue}/10</span>
-                </div>
-              ))}
+                  {historyError && (
+                    <div className="empty-state" role="alert">
+                      Could not load saved history: {historyError}
+                    </div>
+                  )}
+
+                  {historyLoading ? (
+                    <p>Loading your saved assessments?</p>
+                  ) : historyItems.length > 0 ? (
+                    <div className="history-list">
+                      {historyItems.map((item, index) => (
+                        <article
+                          className="history-row"
+                          key={`${item.created_at}-${index}`}
+                        >
+                          <strong>{new Date(item.created_at).toLocaleString()}</strong>
+                          <span>City: {item.city || 'Not recorded'}</span>
+                          <span>
+                            RAPID3: {item.rapid3 == null ? 'Not available' : item.rapid3.toFixed(1)}
+                          </span>
+                          <span>
+                            Experimental score:{' '}
+                            {item.peak_experimental_score == null
+                              ? 'Not available'
+                              : `${(item.peak_experimental_score * 100).toFixed(1)}%`}
+                          </span>
+                          <span>Risk level: {item.risk_level || 'Not available'}</span>
+                        </article>
+                      ))}
+                    </div>
+                  ) : !historyError ? (
+                    <div className="empty-state">
+                      No saved assessments found for this account. Complete an assessment to begin your history.
+                    </div>
+                  ) : null}
+                  <p className="chart-note">
+                    Experimental scores are prototype outputs, not clinically validated probabilities or medical advice.
+                  </p>
+                </>
+              )}
             </section>
           )}
 
           {activePage === 'Assessment' && (
-  <AssessmentPage isGuest={isGuest} />
+  <AssessmentPage isGuest={isGuest} onResult={setLatestAssessment} />
 )
 
 
@@ -884,136 +759,229 @@ function App() {
 }
 
 
-function AssessmentPage({ isGuest }: { isGuest: boolean }) {
+function AssessmentPage({
+  isGuest,
+  onResult,
+}: {
+  isGuest: boolean
+  onResult: (result: AssessmentResult) => void
+}) {
+  const [step, setStep] = useState(0)
+  const [age, setAge] = useState('')
+  const [city, setCity] = useState('Colombo')
   const [pain, setPain] = useState('0')
+  const [globalEstimate, setGlobalEstimate] = useState('0')
   const [fatigue, setFatigue] = useState('0')
-  const [sleep, setSleep] = useState('5')
-  const [notes, setNotes] = useState('')
-  const [saved, setSaved] = useState(false)
+  const [flares30d, setFlares30d] = useState('0')
+  const [symptomChange, setSymptomChange] = useState('same')
+  const [durationYears, setDurationYears] = useState('1')
+  const [sleepDiff, setSleepDiff] = useState('1')
+  const [anxiety, setAnxiety] = useState('1')
+  const [activityMin, setActivityMin] = useState('30')
+  const [heartRate, setHeartRate] = useState('')
+  const functionQuestions = [
+    ['A', 'Getting dressed and ready'],
+    ['B', 'Getting up from a chair or bed'],
+    ['C', 'Eating or using everyday utensils'],
+    ['D', 'Walking on level ground'],
+    ['E', 'Washing and personal care'],
+    ['F', 'Reaching for things above your head'],
+    ['G', 'Opening jars or gripping objects'],
+    ['H', 'Doing usual household activities'],
+    ['I', 'Climbing steps or stairs'],
+    ['J', 'Shopping or other daily errands'],
+  ]
+  const [fnVals, setFnVals] = useState<Record<string, number>>({ A: 0, B: 0, C: 0, D: 0, E: 0, F: 0, G: 0, H: 0, I: 0, J: 0 })
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [result, setResult] = useState<AssessmentResult | null>(null)
+  const stepTitles = ['About you', 'Symptoms today', 'Daily activities', 'Recent patterns', 'Review & result']
+  const progress = ((step + 1) / stepTitles.length) * 100
 
-  function submitAssessment(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-
-    // Demonstration only: no API request or database write occurs.
-    // Guest and patient submissions are not persisted by this function.
-    setSaved(true)
+  function validateStep() {
+    if (step === 0) {
+      const ageNumber = Number(age)
+      if (!age.trim() || !Number.isInteger(ageNumber) || ageNumber < 1 || ageNumber > 120) {
+        setError('Please enter your age in years (1–120).')
+        return false
+      }
+      if (!city.trim()) {
+        setError('Please enter your city.')
+        return false
+      }
+    }
+    setError('')
+    return true
   }
 
+  function nextStep() {
+    if (!validateStep()) return
+    setStep(current => Math.min(current + 1, stepTitles.length - 1))
+    setError('')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  function previousStep() {
+    setError('')
+    setStep(current => Math.max(current - 1, 0))
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!validateStep()) return
+    setBusy(true)
+    setError('')
+    setResult(null)
+
+    const data: AssessmentData = {
+      age: Number(age),
+      symptom_change: symptomChange,
+      city: city.trim(),
+      fn_vals: fnVals,
+      pain: Number(pain),
+      global_estimate: Number(globalEstimate),
+      fatigue: Number(fatigue),
+      flares_30d: Number(flares30d),
+      duration_years: Number(durationYears),
+      sleep_diff: Number(sleepDiff),
+      anxiety: Number(anxiety),
+      activity_min: Number(activityMin),
+      heart_rate: Number(heartRate) || 0,
+    }
+
+    try {
+      const response = isGuest
+        ? await submitGuestAssessment(data)
+        : await sendAssessment(data)
+      setResult(response)
+      onResult(response)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to calculate this assessment. Please try again.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const scale = (label: string, value: string, setter: (value: string) => void, low: string, high: string) => (
+    <label className="guided-question">{label}<strong>{value}/10</strong>
+      <input type="range" min="0" max="10" step="1" value={value} onChange={e => setter(e.target.value)} />
+      <span className="range-hints"><span>{low}</span><span>{high}</span></span>
+    </label>
+  )
+
   return (
-    <section className="panel assessment-panel">
+    <section className="panel assessment-panel guided-assessment">
       <div className="assessment-heading">
-        <span className="eyebrow">
-          {isGuest ? 'GUEST DEMONSTRATION' : 'PATIENT CHECK-IN'}
-        </span>
+        <span className="eyebrow">{isGuest ? 'GUEST ASSESSMENT' : 'PATIENT ASSESSMENT'}</span>
+        <h2>A quick check-in about your health</h2>
+        <p>Answer at your own pace. There are five short steps, and you can go back to change your answers.</p>
+      </div>
+      {isGuest && <div className="guest-banner" role="status"><div><strong>Guest mode — no account required</strong><p>Your result is temporary and is not saved to an account.</p></div></div>}
 
-        <h2>How are you feeling today?</h2>
-
-        <p>
-          Record your symptoms and review your check-in.
-          {isGuest
-            ? ' Your responses are temporary and will not be saved to a patient account.'
-            : ' This prototype currently does not save assessment submissions to your account.'}
-        </p>
+      <div className="guided-progress" aria-label={`Step ${step + 1} of ${stepTitles.length}`}>
+        <div className="guided-progress-top"><span>Step {step + 1} of {stepTitles.length}</span><strong>{stepTitles[step]}</strong></div>
+        <div className="guided-progress-track"><div className="guided-progress-fill" style={{ width: `${progress}%` }} /></div>
+        <div className="guided-step-dots">{stepTitles.map((title, index) => <span key={title} className={index <= step ? 'complete' : ''} aria-label={title}>{index + 1}</span>)}</div>
       </div>
 
-      {isGuest && (
-        <div className="guest-banner" role="status">
-          <div>
-            <strong>Guest mode — temporary assessment</strong>
-            <p>
-              You can complete the assessment without registering.
-              Your responses are not stored in patient history.
-            </p>
+      <form onSubmit={handleSubmit}>
+        {step === 0 && <div className="guided-step-content">
+          <div className="guided-intro"><span className="guided-emoji">👋</span><div><h3>Let's start with a little about you</h3><p>This information helps describe the people taking part in the research.</p></div></div>
+          <label className="guided-question">How old are you? <span className="required-note">Required</span>
+            <input type="number" min="1" max="120" step="1" required value={age} onChange={e => setAge(e.target.value)} placeholder="Enter age in years" />
+            <small>Please enter your age, not your date of birth.</small>
+          </label>
+          <label className="guided-question">Which city are you in? <span className="required-note">Required</span>
+            <input type="text" required maxLength={100} value={city} onChange={e => setCity(e.target.value)} placeholder="e.g. Colombo" />
+            <small>Used to retrieve local environmental information when available.</small>
+          </label>
+          <label className="guided-question">How long have you had RA or related symptoms?
+            <select value={durationYears} onChange={e => setDurationYears(e.target.value)}><option value="0">Less than 1 year / not sure</option><option value="1">1–2 years</option><option value="3">3–5 years</option><option value="6">6–10 years</option><option value="11">More than 10 years</option></select>
+          </label>
+        </div>}
+
+        {step === 1 && <div className="guided-step-content">
+          <div className="guided-intro"><span className="guided-emoji">💬</span><div><h3>How are you feeling today?</h3><p>Choose the number that best matches how you feel right now.</p></div></div>
+          {scale('How much joint pain do you have?', pain, setPain, 'No pain', 'Worst pain')}
+          {scale('How would you rate your overall health?', globalEstimate, setGlobalEstimate, 'Very good', 'Very poor')}
+          {scale('How tired or exhausted do you feel?', fatigue, setFatigue, 'Not tired', 'Extremely tired')}
+          <label className="guided-question">Compared with your usual symptoms, how do you feel today?
+            <div className="choice-grid">{[['better','🙂','Better'],['same','😐','About the same'],['worse','🙁','Worse']].map(([value, emoji, label]) => <button key={value} type="button" className={`choice-card ${symptomChange === value ? 'selected' : ''}`} onClick={() => setSymptomChange(value)}><span>{emoji}</span>{label}</button>)}</div>
+          </label>
+          <label className="guided-question">How many times have your symptoms flared or worsened in the past 30 days?
+            <input type="number" min="0" max="30" step="1" value={flares30d} onChange={e => setFlares30d(e.target.value)} required />
+            <small>The choice above and this count are separate details; enter a count if you remember one.</small>
+          </label>
+        </div>}
+
+        {step === 2 && <div className="guided-step-content">
+          <div className="guided-intro"><span className="guided-emoji">🧩</span><div><h3>How are everyday activities going?</h3><p>Think about the past week. Choose the option that fits you best for each activity.</p></div></div>
+          <p className="research-note">These are brief research questions about daily function. They are not presented as a validated HAQ-DI questionnaire.</p>
+          <div className="function-rating-fields guided-function-fields">
+            {functionQuestions.map(([key, question]) => <label className="guided-question" key={key}>{question}
+              <select value={fnVals[key]} onChange={e => setFnVals(current => ({ ...current, [key]: Number(e.target.value) }))}>
+                <option value={0}>No difficulty</option><option value={1}>Some difficulty</option><option value={2}>A lot of difficulty</option><option value={3}>Unable to do</option>
+              </select>
+            </label>)}
           </div>
+        </div>}
+
+        {step === 3 && <div className="guided-step-content">
+          <div className="guided-intro"><span className="guided-emoji">🌙</span><div><h3>A few things about your recent routine</h3><p>These extra questions explore possible patterns. It's okay if you don't know your heart rate.</p></div></div>
+          <label className="guided-question">How well did you sleep last night?
+            <select value={sleepDiff} onChange={e => setSleepDiff(e.target.value)}><option value="0">Very well</option><option value="1">Okay</option><option value="2">Poorly</option><option value="3">Very poorly</option></select>
+          </label>
+          <label className="guided-question">How stressed or anxious have you felt recently?
+            <select value={anxiety} onChange={e => setAnxiety(e.target.value)}><option value="0">Not at all</option><option value="1">A little</option><option value="2">Quite a bit</option><option value="3">Extremely</option></select>
+          </label>
+          <label className="guided-question">About how many minutes of physical activity did you do today?
+            <input type="number" min="0" max="1440" step="1" required value={activityMin} onChange={e => setActivityMin(e.target.value)} />
+            <small>Include walking, exercise, or other movement. Enter 0 if none.</small>
+          </label>
+          <label className="guided-question">Heart rate (beats per minute) <span className="optional-note">Optional</span>
+            <input type="number" min="30" max="220" step="1" value={heartRate} onChange={e => setHeartRate(e.target.value)} placeholder="Leave blank if unknown" />
+            <small>Only enter a measured value if you know it. FlareGuard does not measure your heart rate.</small>
+          </label>
+        </div>}
+
+        {step === 4 && <div className="guided-step-content">
+          <div className="guided-intro"><span className="guided-emoji">✅</span><div><h3>Review your answers</h3><p>Check your answers before calculating your result. You can go back to edit any step.</p></div></div>
+          <div className="review-list">
+            <div><span>Age</span><strong>{age} years</strong><button type="button" onClick={() => setStep(0)}>Edit</button></div>
+            <div><span>City</span><strong>{city}</strong><button type="button" onClick={() => setStep(0)}>Edit</button></div>
+            <div><span>Joint pain</span><strong>{pain}/10</strong><button type="button" onClick={() => setStep(1)}>Edit</button></div>
+            <div><span>Overall health</span><strong>{globalEstimate}/10</strong><button type="button" onClick={() => setStep(1)}>Edit</button></div>
+            <div><span>Fatigue</span><strong>{fatigue}/10</strong><button type="button" onClick={() => setStep(1)}>Edit</button></div>
+            <div><span>Daily activity responses</span><strong>{Object.keys(fnVals).length} answered</strong><button type="button" onClick={() => setStep(2)}>Edit</button></div>
+            <div><span>Sleep and stress</span><strong>{['Very well','Okay','Poorly','Very poorly'][Number(sleepDiff)]}; {['Not at all','A little','Quite a bit','Extremely'][Number(anxiety)]} stress</strong><button type="button" onClick={() => setStep(3)}>Edit</button></div>
+            <div><span>Physical activity</span><strong>{activityMin} minutes</strong><button type="button" onClick={() => setStep(3)}>Edit</button></div>
+          </div>
+          <p className="research-note">Your age is collected for research context. It is not currently used by the risk calculation. The score is experimental and is not a diagnosis or a clinically validated flare probability.</p>
+        </div>}
+
+        {error && <div className="auth-error" role="alert"><strong>Please check:</strong> {error}</div>}
+        <div className="guided-actions">
+          {step > 0 && <button className="secondary-button" type="button" onClick={previousStep} disabled={busy}>← Back</button>}
+          {step < stepTitles.length - 1
+            ? <button className="primary-button" type="button" onClick={nextStep}>Continue →</button>
+            : <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Calculating your result…' : 'Calculate my assessment'}</button>}
         </div>
-      )}
-
-      <form onSubmit={submitAssessment}>
-        <label>
-          Pain level <strong>{pain}/10</strong>
-          <input
-            type="range"
-            min="0"
-            max="10"
-            value={pain}
-            onChange={(event) => {
-              setPain(event.target.value)
-              setSaved(false)
-            }}
-          />
-        </label>
-
-        <label>
-          Fatigue level <strong>{fatigue}/10</strong>
-          <input
-            type="range"
-            min="0"
-            max="10"
-            value={fatigue}
-            onChange={(event) => {
-              setFatigue(event.target.value)
-              setSaved(false)
-            }}
-          />
-        </label>
-
-        <label>
-          Sleep quality <strong>{sleep}/10</strong>
-          <input
-            type="range"
-            min="0"
-            max="10"
-            value={sleep}
-            onChange={(event) => {
-              setSleep(event.target.value)
-              setSaved(false)
-            }}
-          />
-        </label>
-
-        <label>
-          Optional notes
-          <textarea
-            rows={4}
-            maxLength={1000}
-            value={notes}
-            onChange={(event) => {
-              setNotes(event.target.value)
-              setSaved(false)
-            }}
-            placeholder="How have you been feeling?"
-          />
-        </label>
-
-        <button className="primary-button" type="submit">
-          Review my check-in
-        </button>
-
-        {saved && (
-          <div className="form-success" role="status">
-            <h3>Check-in completed</h3>
-
-            <p>
-              Pain: {pain}/10 · Fatigue: {fatigue}/10 · Sleep quality: {sleep}/10
-            </p>
-
-            {notes.trim() && (
-              <p>
-                <strong>Your notes:</strong> {notes}
-              </p>
-            )}
-
-            <p>
-              {isGuest
-                ? 'This is a temporary demonstration result. It has not been saved to a patient account.'
-                : 'This is a demonstration result. It has not been saved to your patient history.'}
-            </p>
-          </div>
-        )}
       </form>
+
+      {result && <section className="form-success assessment-result" aria-live="polite">
+        <h3>Your assessment result</h3>
+        <p><strong>RAPID3-style score:</strong> {result.assessment.rapid3.toFixed(1)} — {result.assessment.rapid3_category}</p>
+        <p><strong>Function score:</strong> {result.assessment.function_score.toFixed(1)}</p>
+        <p><strong>Experimental score:</strong> {(result.assessment.experimental_score * 100).toFixed(1)}%</p>
+        <p><strong>Risk category:</strong> {result.assessment.risk_label}</p>
+        <p><strong>Location:</strong> {result.weather.city}. Weather source: {result.weather.is_live ? 'live data' : 'estimated/fallback data'}.</p>
+        <h4>Important limitations</h4><ul>{result.limitations.map(item => <li key={item}>{item}</li>)}</ul>
+        <p><strong>Please remember:</strong> this experimental result does not diagnose RA or replace advice from your healthcare professional.</p>
+        {isGuest && <p>Guest result only: this assessment was not saved to an account history.</p>}
+      </section>}
     </section>
   )
 }
-
 
 export default App

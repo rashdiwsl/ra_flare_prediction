@@ -32,6 +32,8 @@ interface AuthResponse {
 }
 
 export interface AssessmentData {
+  age: number
+  symptom_change: string
   city: string
   fn_vals: Record<string, number>
   pain: number
@@ -209,12 +211,24 @@ export function submitAssessment(data: AssessmentData) {
   })
 }
 
+/** Calculate a guest assessment without requiring login or saving account history. */
+export function submitGuestAssessment(data: AssessmentData) {
+  return request<AssessmentResult>('/api/assessments/guest', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
+}
+
 // ============================================================
 // ASSESSMENT HISTORY
 // ============================================================
 
-export function getAssessmentHistory(limit = 10) {
-  const safeLimit = Math.min(100, Math.max(1, limit))
+export function getAssessmentHistory(limit?: number) {
+  if (limit === undefined) {
+    return request<AssessmentHistory>('/api/assessments')
+  }
+
+  const safeLimit = Math.min(100, Math.max(1, Math.floor(limit)))
 
   return request<AssessmentHistory>(
     `/api/assessments?limit=${safeLimit}`,

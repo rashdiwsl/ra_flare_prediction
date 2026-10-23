@@ -9,7 +9,6 @@ import hashlib
 import importlib.util
 import os
 import secrets
-import sqlite3
 import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -19,6 +18,9 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from database import connect as connect_database
+from database import execute as execute_sql
+from database import is_postgres
 
 
 # ============================================================
@@ -103,12 +105,12 @@ models = fusion.load_models()
 # ============================================================
 
 def connect_db():
-    return sqlite3.connect(str(DB_PATH), timeout=10)
+    return connect_database(str(DB_PATH))
 
 
 def init_session_table():
     with connect_db() as conn:
-        conn.execute(
+        execute_sql(conn,
             """
             CREATE TABLE IF NOT EXISTS api_sessions (
                 token_hash TEXT PRIMARY KEY,
@@ -118,7 +120,7 @@ def init_session_table():
             )
             """
         )
-        conn.execute(
+        execute_sql(conn,
             "CREATE INDEX IF NOT EXISTS idx_sessions_username "
             "ON api_sessions(username)"
         )
@@ -135,15 +137,15 @@ def create_session(username: str):
 
     with connect_db() as conn:
         # Remove expired sessions and older sessions for this account.
-        conn.execute(
+        execute_sql(conn,
             "DELETE FROM api_sessions WHERE expires_at <= ?",
             (now.isoformat(),),
         )
-        conn.execute(
+        execute_sql(conn,
             "DELETE FROM api_sessions WHERE username = ?",
             (username,),
         )
-        conn.execute(
+        execute_sql(conn,
             """
             INSERT INTO api_sessions
                 (token_hash, username, expires_at, created_at)
@@ -170,7 +172,7 @@ def get_session_username(request: Request) -> str:
     now = datetime.now(timezone.utc)
 
     with connect_db() as conn:
-        row = conn.execute(
+        row = execute_sql(conn,
             """
             SELECT username, expires_at
             FROM api_sessions
@@ -188,7 +190,7 @@ def get_session_username(request: Request) -> str:
         try:
             expires_at = datetime.fromisoformat(row[1])
         except (ValueError, TypeError):
-            conn.execute(
+            execute_sql(conn,
                 "DELETE FROM api_sessions WHERE token_hash = ?",
                 (token_hash,),
             )
@@ -198,7 +200,7 @@ def get_session_username(request: Request) -> str:
             )
 
         if expires_at <= now:
-            conn.execute(
+            execute_sql(conn,
                 "DELETE FROM api_sessions WHERE token_hash = ?",
                 (token_hash,),
             )
@@ -207,13 +209,13 @@ def get_session_username(request: Request) -> str:
                 detail="Session expired. Please log in again.",
             )
 
-        user_exists = conn.execute(
+        user_exists = execute_sql(conn,
             "SELECT 1 FROM users WHERE username = ?",
             (row[0],),
         ).fetchone()
 
         if not user_exists:
-            conn.execute(
+            execute_sql(conn,
                 "DELETE FROM api_sessions WHERE token_hash = ?",
                 (token_hash,),
             )
@@ -274,6 +276,8 @@ class AssessmentRequest(BaseModel):
     sleep_diff and anxiety use 0-3 scales.
     """
 
+    age: int = Field(ge=1, le=120)
+    symptom_change: str = Field(default="same", pattern="^(better|same|worse)$")
     city: str = Field(default="Colombo", min_length=1, max_length=100)
 
     fn_vals: dict[str, int]
@@ -319,8 +323,9 @@ def system_info():
     return {
         "application": "RA FlareGuard",
         "backend_loaded": True,
-        "database_file_exists": DB_PATH.is_file(),
-        "database_name": DB_PATH.name,
+        "database_type": "postgresql" if is_postgres() else "sqlite",
+        "database_file_exists": None if is_postgres() else DB_PATH.is_file(),
+        "database_name": "postgresql" if is_postgres() else DB_PATH.name,
         "risk_method": "experimental heuristic",
         "clinically_validated": False,
         "trained_fusion_predictions_used_by_risk_score": False,
@@ -383,7 +388,7 @@ def login(request: LoginRequest, response: Response):
         )
 
     with connect_db() as conn:
-        row = conn.execute(
+        row = execute_sql(conn,
             "SELECT display_name FROM users WHERE username = ?",
             (username,),
         ).fetchone()
@@ -409,7 +414,7 @@ def current_user(request: Request):
     username = get_session_username(request)
 
     with connect_db() as conn:
-        row = conn.execute(
+        row = execute_sql(conn,
             "SELECT display_name FROM users WHERE username = ?",
             (username,),
         ).fetchone()
@@ -431,7 +436,7 @@ def logout(request: Request, response: Response):
 
     if token:
         with connect_db() as conn:
-            conn.execute(
+            execute_sql(conn,
                 "DELETE FROM api_sessions WHERE token_hash = ?",
                 (hash_session_token(token),),
             )
@@ -661,6 +666,181 @@ def create_assessment(
         ) from exc
 
 
+
+# ============================================================
+# GUEST ASSESSMENT (NO LOGIN, NOT SAVED TO ACCOUNT HISTORY)
+# ============================================================
+
+@app.post("/api/assessments/guest")
+def create_guest_assessment(assessment: AssessmentRequest):
+    """
+    Calculate an assessment for a guest without requiring authentication
+    and without saving it to a user account or persistent assessment history.
+
+    The response uses the same experimental scoring and projection functions
+    as the authenticated assessment endpoint. It is not a clinically
+    validated flare probability or a trained multimodal prediction.
+    """
+    required_keys = set("ABCDEFGHIJ")
+    supplied_keys = set(assessment.fn_vals.keys())
+
+    if supplied_keys != required_keys:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "fn_vals must contain exactly these keys: "
+                "A, B, C, D, E, F, G, H, I, J."
+            ),
+        )
+
+    for key, value in assessment.fn_vals.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise HTTPException(
+                status_code=422,
+                detail=f"fn_vals[{key}] must be an integer from 0 to 3.",
+            )
+        if value < 0 or value > 3:
+            raise HTTPException(
+                status_code=422,
+                detail=f"fn_vals[{key}] must be from 0 to 3.",
+            )
+
+    city = assessment.city.strip()
+    if not city:
+        raise HTTPException(status_code=422, detail="City cannot be empty.")
+
+    try:
+        fn_score = fusion.haq_di_score(assessment.fn_vals)
+        rapid3 = fusion.rapid3_total(
+            assessment.fn_vals,
+            assessment.pain,
+            assessment.global_estimate,
+        )
+
+        weather = fusion.WeatherClient().current(city)
+        heart_rate_for_model = assessment.heart_rate or 72
+
+        risk_inputs = fusion.RiskInputs(
+            pain=assessment.pain,
+            fn_score=fn_score,
+            global_estimate=assessment.global_estimate,
+            fatigue=assessment.fatigue,
+            flares_30d=assessment.flares_30d,
+            duration_years=assessment.duration_years,
+            sleep_diff=assessment.sleep_diff,
+            anxiety=assessment.anxiety,
+            activity_min=assessment.activity_min,
+            heart_rate=heart_rate_for_model,
+            rapid3=rapid3,
+            temp=weather.temp,
+            humidity=weather.humidity,
+            pressure=weather.pressure,
+        )
+
+        risk_score, contributions = fusion.compute_risk(risk_inputs, models)
+
+        # These are deterministic projections, not trained forecasts.
+        forecast = []
+        for day in range(1, 4):
+            (
+                projected_pain,
+                projected_fatigue,
+                projected_anxiety,
+                projected_sleep_diff,
+            ) = fusion.project_forward(
+                pain=assessment.pain,
+                fatigue=assessment.fatigue,
+                sleep_diff=assessment.sleep_diff,
+                anxiety=assessment.anxiety,
+                flares_30d=assessment.flares_30d,
+                day_offset=day,
+            )
+
+            projected_inputs = replace(
+                risk_inputs,
+                pain=projected_pain,
+                fatigue=projected_fatigue,
+                anxiety=int(round(projected_anxiety)),
+                sleep_diff=int(round(projected_sleep_diff)),
+            )
+            projected_rapid3 = fusion.rapid3_total(
+                assessment.fn_vals,
+                projected_pain,
+                assessment.global_estimate,
+            )
+            projected_inputs = replace(projected_inputs, rapid3=projected_rapid3)
+            projected_score, _ = fusion.compute_risk(projected_inputs, models)
+
+            forecast.append({
+                "day": day,
+                "pain": round(projected_pain, 2),
+                "fatigue": round(projected_fatigue, 2),
+                "anxiety": round(projected_anxiety, 2),
+                "sleep_difficulty": round(projected_sleep_diff, 2),
+                "experimental_score": round(projected_score, 4),
+                "risk_level": fusion.risk_level(projected_score),
+            })
+
+        peak_risk = max(
+            [risk_score] + [item["experimental_score"] for item in forecast]
+        )
+        level = fusion.risk_level(peak_risk)
+        category, _category_color = fusion.rapid3_category(rapid3)
+
+        return {
+            "success": True,
+            "message": "Guest assessment calculated. It was not saved to account history.",
+            "assessment": {
+                "username": "Guest",
+                "age": assessment.age,
+                "symptom_change": assessment.symptom_change,
+                "city": city,
+                "created_at": datetime.now().isoformat(),
+                "rapid3": round(rapid3, 2),
+                "rapid3_category": category,
+                "function_score": round(fn_score, 2),
+                "pain": assessment.pain,
+                "global_estimate": assessment.global_estimate,
+                "experimental_score": round(risk_score, 4),
+                "risk_level": fusion.risk_level(risk_score),
+                "risk_label": fusion.risk_label(risk_score),
+                "risk_color": fusion.risk_color(risk_score),
+                "peak_experimental_score": round(peak_risk, 4),
+                "peak_risk_level": level,
+                "contributions": {
+                    key: round(float(value), 4)
+                    for key, value in contributions.items()
+                },
+            },
+            "weather": {
+                "city": city,
+                "temperature": weather.temp,
+                "humidity": weather.humidity,
+                "pressure": weather.pressure,
+                "description": weather.desc,
+                "is_live": weather.is_live,
+            },
+            "forecast": forecast,
+            "limitations": [
+                "The score is an experimental heuristic, not a calibrated flare probability.",
+                "The risk calculation does not combine trained model predictions.",
+                "Future scores use a deterministic projection, not a trained forecasting model.",
+                "Weather may use an estimated fallback instead of live measurements.",
+                "This research prototype is not a diagnosis or a substitute for clinical care.",
+                "Guest assessments are not saved to account history.",
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Do not expose internal paths or stack traces to clients.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Guest assessment failed ({type(exc).__name__}).",
+        ) from exc
+
+
 # ============================================================
 # ASSESSMENT HISTORY
 # ============================================================
@@ -668,15 +848,15 @@ def create_assessment(
 @app.get("/api/assessments")
 def assessment_history(
     request: Request,
-    limit: int = 10,
+    limit: int | None = None,
 ):
-    """Return only the authenticated user's saved assessment summaries."""
+    """Return the authenticated user's assessment history, newest first."""
     username = get_session_username(request)
 
-    if limit < 1 or limit > 100:
+    if limit is not None and (limit < 1 or limit > 100):
         raise HTTPException(
             status_code=422,
-            detail="limit must be between 1 and 100.",
+            detail="When provided, limit must be between 1 and 100.",
         )
 
     try:

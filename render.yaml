@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: flareguard
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-api.txt && npm --prefix frontend ci && npm --prefix frontend run build
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: PYTHON_VERSION
+        value: "3.12.4"
