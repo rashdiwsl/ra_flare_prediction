@@ -1,5 +1,4 @@
-
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import {
   getCurrentUser,
   getAssessmentHistory,
@@ -14,13 +13,14 @@ import {
 } from './services/api'
 import './App.css'
 
-type Page = 'Overview' | 'My Symptoms' | 'Assessment' | 'Forecast History'
+type Page = 'Overview' | 'My Symptoms' | 'Assessment' | 'Results' | 'Forecast History'
 type AuthMode = 'login' | 'register'
 
 const navigation: { label: Page; icon: string }[] = [
   { label: 'Overview', icon: '⌂' },
   { label: 'My Symptoms', icon: '◷' },
   { label: 'Assessment', icon: '✓' },
+  { label: 'Results', icon: '◉' },
   { label: 'Forecast History', icon: '▤' },
 ]
 
@@ -310,8 +310,32 @@ function App() {
   const [historyItems, setHistoryItems] = useState<import('./services/api').HistoryItem[]>([])
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyError, setHistoryError] = useState('')
+  const assessmentRequestVersion = useRef(0)
+  const historyRequestVersion = useRef(0)
+
+  function clearSessionAssessmentState() {
+    assessmentRequestVersion.current += 1
+    historyRequestVersion.current += 1
+    setLatestAssessment(null)
+    setHistoryItems([])
+    setHistoryLoading(false)
+    setHistoryError('')
+  }
+
+  function navigateTo(page: Page) {
+    assessmentRequestVersion.current += 1
+    setActivePage(page)
+  }
+
+  function startAssessment() {
+    assessmentRequestVersion.current += 1
+    setLatestAssessment(null)
+    setActivePage('Assessment')
+  }
 
   const loadAssessmentHistory = useCallback(async () => {
+    const requestVersion = ++historyRequestVersion.current
+
     if (isGuest || !user) {
       setHistoryItems([])
       setHistoryError('')
@@ -324,13 +348,19 @@ function App() {
 
     try {
       const response = await getAssessmentHistory()
-      setHistoryItems(response.assessments)
+      if (requestVersion === historyRequestVersion.current) {
+        setHistoryItems(response.assessments)
+      }
     } catch (err) {
-      setHistoryError(
-        err instanceof Error ? err.message : 'Unable to load assessment history.',
-      )
+      if (requestVersion === historyRequestVersion.current) {
+        setHistoryError(
+          err instanceof Error ? err.message : 'Unable to load assessment history.',
+        )
+      }
     } finally {
-      setHistoryLoading(false)
+      if (requestVersion === historyRequestVersion.current) {
+        setHistoryLoading(false)
+      }
     }
   }, [isGuest, user])
 
@@ -365,16 +395,17 @@ function App() {
     }
 
     let cancelled = false
+    const requestVersion = ++historyRequestVersion.current
 
     getAssessmentHistory()
       .then((response) => {
-        if (!cancelled) {
+        if (!cancelled && requestVersion === historyRequestVersion.current) {
           setHistoryItems(response.assessments)
           setHistoryError('')
         }
       })
       .catch((err: unknown) => {
-        if (!cancelled) {
+        if (!cancelled && requestVersion === historyRequestVersion.current) {
           setHistoryError(
             err instanceof Error
               ? err.message
@@ -383,7 +414,7 @@ function App() {
         }
       })
       .finally(() => {
-        if (!cancelled) {
+        if (!cancelled && requestVersion === historyRequestVersion.current) {
           setHistoryLoading(false)
         }
       })
@@ -399,6 +430,7 @@ function App() {
 
     try {
       await logout()
+      clearSessionAssessmentState()
       setUser(null)
       setIsGuest(false)
       setActivePage('Overview')
@@ -414,6 +446,7 @@ function App() {
   }
 
   function handleGuestExit() {
+    clearSessionAssessmentState()
     setIsGuest(false)
     setActivePage('Overview')
     setAuthError('')
@@ -434,10 +467,13 @@ function App() {
     return (
       <AuthScreen
         onAuthenticated={(authenticatedUser) => {
+          clearSessionAssessmentState()
           setUser(authenticatedUser)
           setIsGuest(false)
+          setActivePage('Overview')
         }}
         onGuest={() => {
+          clearSessionAssessmentState()
           setIsGuest(true)
           setActivePage('Overview')
         }}
@@ -459,7 +495,7 @@ function App() {
           href="#"
           onClick={(event) => {
             event.preventDefault()
-            setActivePage('Overview')
+            navigateTo('Overview')
           }}
         >
           <span className="brand-mark">F</span>
@@ -482,7 +518,13 @@ function App() {
               aria-current={
                 activePage === item.label ? 'page' : undefined
               }
-              onClick={() => setActivePage(item.label)}
+              onClick={() => {
+                if (item.label === 'Assessment') {
+                  startAssessment()
+                } else {
+                  navigateTo(item.label)
+                }
+              }}
             >
               <span className="nav-icon" aria-hidden="true">
                 {item.icon}
@@ -593,7 +635,7 @@ function App() {
             <button
               type="button"
               className="primary-button"
-              onClick={() => setActivePage('Assessment')}
+              onClick={startAssessment}
             >
               <span>＋</span> Record symptoms
             </button>
@@ -607,43 +649,310 @@ function App() {
           </div>
 
           {activePage === 'Overview' && (
-            <section className="panel secondary-page">
-              <h2>Your assessment overview</h2>
+            <section className="overview-dashboard" aria-label="Health overview">
+              <div className="overview-metrics">
+                <article className="overview-metric-card">
+                  <span className="overview-metric-icon blue" aria-hidden="true">◉</span>
+                  <span className="overview-metric-label">LATEST RAPID3-STYLE SCORE</span>
+                  <strong>
+                    {latestAssessment
+                      ? latestAssessment.assessment.rapid3.toFixed(1)
+                      : historyItems[0]?.rapid3 == null
+                        ? '—'
+                        : historyItems[0].rapid3.toFixed(1)}
+                  </strong>
+                  <small>
+                    {latestAssessment
+                      ? latestAssessment.assessment.rapid3_category
+                      : historyItems[0]
+                        ? 'From your latest saved assessment'
+                        : 'Complete a check-in to see this value'}
+                  </small>
+                </article>
+
+                <article className="overview-metric-card">
+                  <span className="overview-metric-icon coral" aria-hidden="true">♡</span>
+                  <span className="overview-metric-label">PAIN REPORTED</span>
+                  <strong>{latestAssessment ? `${latestAssessment.assessment.pain}<small>/10</small>` : '—'}</strong>
+                  <small>{latestAssessment ? 'In your latest check-in' : 'Record a check-in to see this value'}</small>
+                </article>
+
+                <article className="overview-metric-card">
+                  <span className="overview-metric-icon violet" aria-hidden="true">↗</span>
+                  <span className="overview-metric-label">FUNCTION SCORE</span>
+                  <strong>{latestAssessment ? latestAssessment.assessment.function_score.toFixed(1) : '—'}</strong>
+                  <small>{latestAssessment ? 'Based on your activity answers' : 'From your latest check-in'}</small>
+                </article>
+
+                <article className="overview-metric-card">
+                  <span className="overview-metric-icon mint" aria-hidden="true">⌁</span>
+                  <span className="overview-metric-label">EXPERIMENTAL SCORE</span>
+                  <strong>
+                    {latestAssessment
+                      ? `${(latestAssessment.assessment.experimental_score * 100).toFixed(0)}%`
+                      : historyItems[0]?.peak_experimental_score == null
+                        ? '—'
+                        : `${(historyItems[0].peak_experimental_score * 100).toFixed(0)}%`}
+                  </strong>
+                  <small>Prototype output, not a flare probability</small>
+                </article>
+              </div>
+
+              <div className="overview-content-grid">
+                <section className="overview-panel overview-trend-panel">
+                  <div className="overview-panel-heading">
+                    <div>
+                      <p className="eyebrow">YOUR PROGRESS</p>
+                      <h2>Recent check-ins</h2>
+                      <p>
+                        {isGuest
+                          ? 'Guest assessments are not saved to your check-in history'
+                          : 'RAPID3-style scores from your saved assessments'}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="overview-link-button"
+                      onClick={() => navigateTo('My Symptoms')}
+                    >
+                      View history <span aria-hidden="true">→</span>
+                    </button>
+                  </div>
+
+                  {historyItems.filter((item) => item.rapid3 != null).length > 1 ? (
+                    <div
+                      className="overview-chart"
+                      role="img"
+                      aria-label={`RAPID3-style score chart for ${Math.min(historyItems.filter((item) => item.rapid3 != null).length, 7)} recent saved assessments`}
+                    >
+                      <div className="overview-chart-guides" aria-hidden="true">
+                        <span>30</span><span>20</span><span>10</span><span>0</span>
+                      </div>
+                      <div className="overview-chart-bars">
+                        {historyItems
+                          .filter((item) => item.rapid3 != null)
+                          .slice(0, 7)
+                          .reverse()
+                          .map((item, index) => {
+                            const score = item.rapid3 ?? 0
+                            const height = Math.max(5, Math.min(100, (score / 30) * 100))
+                            return (
+                              <div className="overview-chart-column" key={`${item.created_at}-${index}`}>
+                                <strong>{score.toFixed(1)}</strong>
+                                <span className="overview-chart-bar" style={{ height: `${height}%` }} />
+                                <small>{new Date(item.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</small>
+                              </div>
+                            )
+                          })}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="overview-chart-empty">
+                      <span aria-hidden="true">⌁</span>
+                      <strong>Your progress will appear here</strong>
+                      <p>
+                        {isGuest
+                          ? 'Guest check-ins are temporary. Sign in to track your progress over time.'
+                          : 'Complete at least two saved check-ins to see your score history.'}
+                      </p>
+                      <button type="button" className="overview-link-button" onClick={startAssessment}>
+                        Start a check-in <span aria-hidden="true">→</span>
+                      </button>
+                    </div>
+                  )}
+                  <p className="overview-chart-note">Scores summarize submitted answers and are not a diagnosis or a measure of disease activity.</p>
+                </section>
+
+                <section className="overview-panel overview-checkin-panel">
+                  <div className="overview-checkin-art" aria-hidden="true">
+                    <span className="overview-art-orbit orbit-one" />
+                    <span className="overview-art-orbit orbit-two" />
+                    <span className="overview-art-heart">♡</span>
+                    <span className="overview-art-spark spark-one">✦</span>
+                    <span className="overview-art-spark spark-two">✦</span>
+                  </div>
+                  <p className="eyebrow">A MOMENT FOR YOU</p>
+                  <h2>How are you feeling today?</h2>
+                  <p className="overview-checkin-copy">A quick check-in helps you reflect on symptoms and daily activities over time.</p>
+                  <button type="button" className="primary-button" onClick={startAssessment}>
+                    Start check-in <span aria-hidden="true">→</span>
+                  </button>
+                  {latestAssessment && (
+                    <button type="button" className="overview-results-link" onClick={() => navigateTo('Results')}>
+                      Review your latest results
+                    </button>
+                  )}
+                </section>
+              </div>
+
+              <section className="overview-panel overview-recent-panel">
+                <div className="overview-panel-heading">
+                  <div>
+                    <p className="eyebrow">YOUR ACTIVITY</p>
+                    <h2>Recent assessments</h2>
+                  </div>
+                  <button type="button" className="overview-link-button" onClick={() => navigateTo('My Symptoms')}>
+                    See all <span aria-hidden="true">→</span>
+                  </button>
+                </div>
+                {isGuest ? (
+                  latestAssessment ? (
+                    <article className="overview-activity-row">
+                      <span className="overview-activity-icon" aria-hidden="true">✓</span>
+                      <div><strong>Check-in completed</strong><small>{new Date(latestAssessment.assessment.created_at).toLocaleString()}</small></div>
+                      <span className="overview-activity-value">RAPID3 {latestAssessment.assessment.rapid3.toFixed(1)}</span>
+                    </article>
+                  ) : (
+                    <p className="overview-activity-empty">Your check-ins will appear here after you complete an assessment.</p>
+                  )
+                ) : historyLoading ? (
+                  <p className="overview-activity-empty">Loading your saved assessments…</p>
+                ) : historyError ? (
+                  <p className="overview-activity-empty" role="alert">Could not load your saved assessments: {historyError}</p>
+                ) : historyItems.length > 0 ? (
+                  historyItems.slice(0, 3).map((item, index) => (
+                    <article className="overview-activity-row" key={`${item.created_at}-${index}`}>
+                      <span className="overview-activity-icon" aria-hidden="true">✓</span>
+                      <div><strong>Check-in completed</strong><small>{new Date(item.created_at).toLocaleString()}{item.city ? ` · ${item.city}` : ''}</small></div>
+                      <span className="overview-activity-value">{item.rapid3 == null ? 'Score unavailable' : `RAPID3 ${item.rapid3.toFixed(1)}`}</span>
+                    </article>
+                  ))
+                ) : (
+                  <p className="overview-activity-empty">No saved assessments yet. Complete your first check-in to get started.</p>
+                )}
+              </section>
+            </section>
+          )}
+
+          {activePage === 'Results' && (
+            <section className="panel secondary-page results-page">
               {!latestAssessment ? (
-                <div className="empty-state">
-                  <h3>No assessment yet</h3>
-                  <p>Complete an assessment to see the result calculated from your answers. No sample health values are displayed.</p>
-                  <button type="button" className="primary-button" onClick={() => setActivePage('Assessment')}>
-                    Start assessment →
+                <div className="results-empty">
+                  <span className="results-empty-icon" aria-hidden="true">✓</span>
+                  <h2>Your assessment summary</h2>
+                  <p>Complete an assessment to see a summary based on your answers.</p>
+                  <button type="button" className="primary-button" onClick={startAssessment}>
+                    Start assessment <span aria-hidden="true">→</span>
                   </button>
                 </div>
               ) : (
                 <>
-                  <p>Latest assessment · {new Date(latestAssessment.assessment.created_at).toLocaleString()}</p>
-                  <div className="stats-grid">
-                    <article className="stat-card">
-                      <div className="stat-label">RAPID3 SCORE</div>
-                      <div className="stat-value">{latestAssessment.assessment.rapid3.toFixed(1)}</div>
-                      <p>{latestAssessment.assessment.rapid3_category}</p>
+                  <div className="results-heading">
+                    <div>
+                      <p className="eyebrow">YOUR LATEST CHECK-IN</p>
+                      <h2>Assessment results</h2>
+                      <p className="results-date">{new Date(latestAssessment.assessment.created_at).toLocaleString()}</p>
+                    </div>
+                    <span className="results-session-label">{isGuest ? 'Guest result' : 'Saved assessment'}</span>
+                  </div>
+
+                  <article className="risk-result-card">
+                    <div className="risk-result-topline">
+                      <span className="risk-result-label">EXPERIMENTAL SCORE</span>
+                      <span className="risk-category-pill">{latestAssessment.assessment.risk_label}</span>
+                    </div>
+                    <div className="risk-result-value">
+                      {(latestAssessment.assessment.experimental_score * 100).toFixed(1)}<span>%</span>
+                    </div>
+                    <div
+                      className="risk-meter"
+                      role="img"
+                      aria-label={`Visual indicator for experimental score ${(latestAssessment.assessment.experimental_score * 100).toFixed(1)} percent; this is not a validated flare probability`}
+                    >
+                      <span style={{ width: `${Math.max(0, Math.min(100, latestAssessment.assessment.experimental_score * 100))}%` }} />
+                    </div>
+                    <p className="risk-result-explainer">
+                      An experimental score calculated by this research prototype. It is <strong>not</strong> a validated probability that an RA flare will occur.
+                    </p>
+                  </article>
+
+                  <div className="result-metrics-grid">
+                    <article className="result-metric-card">
+                      <span className="result-metric-icon" aria-hidden="true">◉</span>
+                      <span className="result-metric-label">RAPID3-style score</span>
+                      <strong>{latestAssessment.assessment.rapid3.toFixed(1)}</strong>
+                      <span className="result-metric-note">{latestAssessment.assessment.rapid3_category}</span>
                     </article>
-                    <article className="stat-card">
-                      <div className="stat-label">EXPERIMENTAL SCORE</div>
-                      <div className="stat-value">{(latestAssessment.assessment.experimental_score * 100).toFixed(1)}<span>%</span></div>
-                      <p>{latestAssessment.assessment.risk_label}</p>
+                    <article className="result-metric-card">
+                      <span className="result-metric-icon" aria-hidden="true">↗</span>
+                      <span className="result-metric-label">Function score</span>
+                      <strong>{latestAssessment.assessment.function_score.toFixed(1)}</strong>
+                      <span className="result-metric-note">From your function answers</span>
                     </article>
-                    <article className="stat-card">
-                      <div className="stat-label">PAIN LEVEL</div>
-                      <div className="stat-value">{latestAssessment.assessment.pain}<span>/10</span></div>
-                      <p>Reported by you</p>
-                    </article>
-                    <article className="stat-card">
-                      <div className="stat-label">FUNCTION SCORE</div>
-                      <div className="stat-value">{latestAssessment.assessment.function_score.toFixed(1)}</div>
-                      <p>Calculated from function responses</p>
+                    <article className="result-metric-card">
+                      <span className="result-metric-icon" aria-hidden="true">♡</span>
+                      <span className="result-metric-label">Pain reported</span>
+                      <strong>{latestAssessment.assessment.pain}<small>/10</small></strong>
+                      <span className="result-metric-note">Your answer</span>
                     </article>
                   </div>
-                  <p className="chart-note">Experimental score is a heuristic output, not a validated probability of an RA flare. This prototype does not provide medical advice.</p>
-                  <button type="button" className="primary-button" onClick={() => setActivePage('Assessment')}>Complete another assessment →</button>
+
+                  <section className="patient-meaning-section">
+                    <div className="patient-section-heading">
+                      <span className="patient-section-icon" aria-hidden="true">♡</span>
+                      <div>
+                        <p className="eyebrow">IN PLAIN LANGUAGE</p>
+                        <h3>What your answers tell you</h3>
+                      </div>
+                    </div>
+                    <p>
+                      This is a snapshot of the answers you gave today, not a diagnosis.
+                      {latestAssessment.assessment.pain === 0
+                        ? ' You reported no pain in this check-in.'
+                        : ` You reported pain at ${latestAssessment.assessment.pain}/10 in this check-in.`}
+                      {' '}Your RAPID3-style and function scores summarise responses using this prototype's scoring approach; they do not by themselves establish whether your RA is active or in remission.
+                    </p>
+                    <div className="patient-observation-grid">
+                      <div>
+                        <strong>{latestAssessment.assessment.pain}/10</strong>
+                        <span>Pain you reported</span>
+                      </div>
+                      <div>
+                        <strong>{latestAssessment.assessment.function_score.toFixed(1)}</strong>
+                        <span>Function score from your activity answers</span>
+                      </div>
+                    </div>
+                  </section>
+
+                  <section className="patient-next-steps">
+                    <div className="patient-section-heading">
+                      <span className="patient-section-icon" aria-hidden="true">✓</span>
+                      <div>
+                        <p className="eyebrow">YOUR NEXT STEPS</p>
+                        <h3>What you can do next</h3>
+                      </div>
+                    </div>
+                    <ul>
+                      <li><strong>Keep checking in:</strong> record how your pain, fatigue, sleep and daily activities change over time.</li>
+                      <li><strong>Look for changes:</strong> compare future check-ins with how you usually feel, rather than relying on one score.</li>
+                      <li><strong>Ask for support when needed:</strong> contact your healthcare professional if symptoms persist, worsen, or concern you. Do not change medication based on this result.</li>
+                    </ul>
+                  </section>
+
+                  <details className="interpretation-details">
+                    <summary>Technical details and important limitations</summary>
+                    <ul>
+                      <li>The experimental score is a heuristic, not a calibrated flare probability.</li>
+                      <li>The risk calculation does not combine trained model predictions.</li>
+                      <li>Any future scores are deterministic projections, not trained forecasts.</li>
+                      <li>Weather information may use an estimated fallback rather than live measurements.</li>
+                      <li>A score of zero does not by itself confirm remission or establish a diagnosis.</li>
+                    </ul>
+                    <p>This research prototype is not a diagnosis and does not replace advice from your healthcare professional.</p>
+                  </details>
+
+                  {isGuest && (
+                    <p className="guest-result-note">Guest result only: this assessment was not saved to an account history.</p>
+                  )}
+
+                  <div className="results-actions">
+                    <button type="button" className="primary-button" onClick={startAssessment}>
+                      Update assessment <span aria-hidden="true">→</span>
+                    </button>
+                    <button type="button" className="secondary-button" onClick={() => navigateTo('My Symptoms')}>
+                      View symptom history
+                    </button>
+                  </div>
                 </>
               )}
             </section>
@@ -721,7 +1030,27 @@ function App() {
           )}
 
           {activePage === 'Assessment' && (
-  <AssessmentPage isGuest={isGuest} onResult={setLatestAssessment} />
+  <AssessmentPage
+    isGuest={isGuest}
+    onSubmissionStart={() => {
+      setLatestAssessment(null)
+      return ++assessmentRequestVersion.current
+    }}
+    isSubmissionCurrent={(requestVersion) =>
+      requestVersion === assessmentRequestVersion.current
+    }
+    onResult={(requestVersion, result) => {
+      if (requestVersion !== assessmentRequestVersion.current) {
+        return
+      }
+      setLatestAssessment(result)
+      if (!isGuest) {
+        void loadAssessmentHistory()
+      }
+      setActivePage('Results')
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    }}
+  />
 )
 
 
@@ -761,10 +1090,14 @@ function App() {
 
 function AssessmentPage({
   isGuest,
+  onSubmissionStart,
+  isSubmissionCurrent,
   onResult,
 }: {
   isGuest: boolean
-  onResult: (result: AssessmentResult) => void
+  onSubmissionStart: () => number
+  isSubmissionCurrent: (requestVersion: number) => boolean
+  onResult: (requestVersion: number, result: AssessmentResult) => void
 }) {
   const [step, setStep] = useState(0)
   const [age, setAge] = useState('')
@@ -794,7 +1127,6 @@ function AssessmentPage({
   const [fnVals, setFnVals] = useState<Record<string, number>>({ A: 0, B: 0, C: 0, D: 0, E: 0, F: 0, G: 0, H: 0, I: 0, J: 0 })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [result, setResult] = useState<AssessmentResult | null>(null)
   const stepTitles = ['About you', 'Symptoms today', 'Daily activities', 'Recent patterns', 'Review & result']
   const progress = ((step + 1) / stepTitles.length) * 100
 
@@ -832,7 +1164,7 @@ function AssessmentPage({
     if (!validateStep()) return
     setBusy(true)
     setError('')
-    setResult(null)
+    const requestVersion = onSubmissionStart()
 
     const data: AssessmentData = {
       age: Number(age),
@@ -854,10 +1186,17 @@ function AssessmentPage({
       const response = isGuest
         ? await submitGuestAssessment(data)
         : await sendAssessment(data)
-      setResult(response)
-      onResult(response)
+      if (!isSubmissionCurrent(requestVersion)) {
+        return
+      }
+      if (response.success !== true || !response.assessment) {
+        throw new Error('The API did not return a completed assessment. Please try again.')
+      }
+      onResult(requestVersion, response)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to calculate this assessment. Please try again.')
+      if (isSubmissionCurrent(requestVersion)) {
+        setError(err instanceof Error ? err.message : 'Unable to calculate this assessment. Please try again.')
+      }
     } finally {
       setBusy(false)
     }
@@ -969,17 +1308,6 @@ function AssessmentPage({
         </div>
       </form>
 
-      {result && <section className="form-success assessment-result" aria-live="polite">
-        <h3>Your assessment result</h3>
-        <p><strong>RAPID3-style score:</strong> {result.assessment.rapid3.toFixed(1)} — {result.assessment.rapid3_category}</p>
-        <p><strong>Function score:</strong> {result.assessment.function_score.toFixed(1)}</p>
-        <p><strong>Experimental score:</strong> {(result.assessment.experimental_score * 100).toFixed(1)}%</p>
-        <p><strong>Risk category:</strong> {result.assessment.risk_label}</p>
-        <p><strong>Location:</strong> {result.weather.city}. Weather source: {result.weather.is_live ? 'live data' : 'estimated/fallback data'}.</p>
-        <h4>Important limitations</h4><ul>{result.limitations.map(item => <li key={item}>{item}</li>)}</ul>
-        <p><strong>Please remember:</strong> this experimental result does not diagnose RA or replace advice from your healthcare professional.</p>
-        {isGuest && <p>Guest result only: this assessment was not saved to an account history.</p>}
-      </section>}
     </section>
   )
 }

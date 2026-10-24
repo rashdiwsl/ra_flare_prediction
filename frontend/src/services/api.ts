@@ -103,8 +103,50 @@ export interface AssessmentHistory {
 }
 
 interface ApiError {
-  detail?: string
+  detail?: string | ApiValidationIssue[]
   message?: string
+}
+
+interface ApiValidationIssue {
+  loc?: Array<string | number>
+  msg?: string
+}
+
+function getApiErrorMessage(data: unknown, status: number): string {
+  if (typeof data === 'object' && data !== null) {
+    const errorData = data as ApiError
+
+    if (typeof errorData.detail === 'string') {
+      return errorData.detail
+    }
+
+    if (Array.isArray(errorData.detail)) {
+      const validationMessages = errorData.detail.flatMap((issue) => {
+        if (!issue || typeof issue !== 'object') {
+          return []
+        }
+
+        const location = Array.isArray(issue.loc)
+          ? issue.loc.filter((part) => part !== 'body').join('.')
+          : ''
+        const message = typeof issue.msg === 'string' ? issue.msg : ''
+
+        return message
+          ? [`${location ? `${location}: ` : ''}${message}`]
+          : []
+      })
+
+      if (validationMessages.length > 0) {
+        return validationMessages.join('; ')
+      }
+    }
+
+    if (typeof errorData.message === 'string') {
+      return errorData.message
+    }
+  }
+
+  return `Request failed (${status}).`
 }
 
 // ============================================================
@@ -142,16 +184,7 @@ async function request<T>(
   }
 
   if (!response.ok) {
-    const errorData = data as ApiError
-
-    const message =
-      typeof errorData?.detail === 'string'
-        ? errorData.detail
-        : typeof errorData?.message === 'string'
-          ? errorData.message
-          : `Request failed (${response.status}).`
-
-    throw new Error(message)
+    throw new Error(getApiErrorMessage(data, response.status))
   }
 
   return data as T

@@ -104,6 +104,12 @@ models = fusion.load_models()
 # DATABASE AND SESSION HELPERS
 # ============================================================
 
+def _day_weather(weather_days, day, today_weather):
+    # Use that day's forecast when available, otherwise today's weather.
+    w = weather_days[day - 1] if len(weather_days) >= day else today_weather
+    return {"temp": w.temp, "humidity": w.humidity, "pressure": w.pressure}
+
+
 def connect_db():
     return connect_database(str(DB_PATH))
 
@@ -539,6 +545,7 @@ def create_assessment(
 
         # This is a deterministic symptom projection, not a trained
         # future-risk model. Compute projected scores for days 1-3.
+        weather_days = fusion.WeatherClient().forecast(city, days=3)
         forecast = []
 
         for day in range(1, 4):
@@ -562,6 +569,7 @@ def create_assessment(
                 fatigue=projected_fatigue,
                 anxiety=int(round(projected_anxiety)),
                 sleep_diff=int(round(projected_sleep_diff)),
+                **_day_weather(weather_days, day, weather),
             )
 
             projected_rapid3 = fusion.rapid3_total(
@@ -587,6 +595,8 @@ def create_assessment(
                 "sleep_difficulty": round(projected_sleep_diff, 2),
                 "experimental_score": round(projected_score, 4),
                 "risk_level": fusion.risk_level(projected_score),
+                "temperature": round(float(projected_inputs.temp), 1),
+                "humidity": round(float(projected_inputs.humidity)),
             })
 
         peak_risk = max(
@@ -740,6 +750,7 @@ def create_guest_assessment(assessment: AssessmentRequest):
         risk_score, contributions = fusion.compute_risk(risk_inputs, models)
 
         # These are deterministic projections, not trained forecasts.
+        weather_days = fusion.WeatherClient().forecast(city, days=3)
         forecast = []
         for day in range(1, 4):
             (
@@ -762,6 +773,7 @@ def create_guest_assessment(assessment: AssessmentRequest):
                 fatigue=projected_fatigue,
                 anxiety=int(round(projected_anxiety)),
                 sleep_diff=int(round(projected_sleep_diff)),
+                **_day_weather(weather_days, day, weather),
             )
             projected_rapid3 = fusion.rapid3_total(
                 assessment.fn_vals,
@@ -779,6 +791,8 @@ def create_guest_assessment(assessment: AssessmentRequest):
                 "sleep_difficulty": round(projected_sleep_diff, 2),
                 "experimental_score": round(projected_score, 4),
                 "risk_level": fusion.risk_level(projected_score),
+                "temperature": round(float(projected_inputs.temp), 1),
+                "humidity": round(float(projected_inputs.humidity)),
             })
 
         peak_risk = max(
