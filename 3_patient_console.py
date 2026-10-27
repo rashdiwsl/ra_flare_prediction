@@ -1,5 +1,5 @@
 """
-RA FlareGuard — Patient Console (Production Build)
+RA FlareGuard — Patient Console (Research Prototype)
 =============================================================================
 Clinical standards:
   RAPID3      Pincus et al., J Rheumatol 2008;35:2136
@@ -10,15 +10,16 @@ Clinical standards:
   RADAI       Stucki et al., Arthritis Rheum 1995;38:795
   DAS28       Prevoo et al., Arthritis Rheum 1995;38:44 (DAS28-ESR/CRP)
 
-This file is the Streamlit presentation layer only. All model loading,
-weather retrieval, RAPID3/HAQ-DI scoring, risk fusion, and persistence
+This file is the Streamlit presentation layer only. Base-model loading,
+weather retrieval, RAPID3/HAQ-DI scoring, experimental heuristic risk scoring,
+and persistence
 of the *existing* fields live in the framework-agnostic backend module
 `2_fusion.py`, loaded below via importlib (its filename starts with a
 digit, so it can't be `import`-ed directly as a regular Python identifier).
 
-Every fusion.* call signature, argument order, and score-calculation
-usage from the original console is preserved unchanged in this rewrite —
-only the Streamlit presentation/production layer around it was touched.
+Backend call signatures, argument order, and score-calculation usage from the
+original console are preserved in this rewrite — only the Streamlit
+presentation/production layer around them was touched.
 
 PRODUCTION NOTES (read before a live clinical / viva deployment)
 -------------------------------------------------------------------------
@@ -33,27 +34,30 @@ PRODUCTION NOTES (read before a live clinical / viva deployment)
    what's displayed or stored.
 3. DAS28 (swollen/tender joint counts + optional ESR/CRP) is collected
    and displayed for clinical completeness and audit, but by design is
-   NOT wired into `fusion.compute_risk()` — the trained model's input
-   contract is left untouched.
+   NOT wired into `fusion.compute_risk()` — the heuristic's existing input
+   contract is left unchanged.
 4. Auto-save: every form widget below is bound directly to
    `st.session_state` via its `key`, so a value is captured the instant
    it changes — not only when "Continue" is pressed. A browser refresh
    or crash mid-form loses nothing already answered.
-5. Offline resilience: Supabase writes are wrapped in bounded retry
-   logic. If every retry fails (e.g. clinic Wi-Fi drop), the payload is
-   appended to a local `pending_sync.json` queue instead of being
-   dropped, and is retried automatically on the next successful run of
-   this console. Local persistence via `fusion.save_assessment()` /
-   `fusion.get_history()` remains the primary store the in-app
-   "Previous Scores" panel reads from, independent of cloud status.
+5. Local persistence (zero-downtime): every completed assessment is
+   written straight to a local SQLite database, `flareguard.db`, in the
+   `patient_assessments` table — no network round-trip, no cloud
+   provider, no outage window. `init_db()` auto-creates the database
+   file and table on first run if they don't already exist. This
+   replaces the previous Supabase-backed cloud audit log so the console
+   keeps working end-to-end even with no internet connection at all.
+   Local history via `fusion.save_assessment()` / `fusion.get_history()`
+   remains the separate store the in-app "Previous Scores" panel reads
+   from, unaffected by this change.
 """
 
 import csv
 import importlib.util
-import json
 import logging
 import math
 import os
+import sqlite3
 import sys
 import time
 import uuid
@@ -65,15 +69,15 @@ import streamlit as st
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("raflareguard")
 
-APP_VERSION = "v2.4-production"
-SITE_LABEL = "Clinical Environment · Site 01 · Patient Self-Assessment Mode"
+APP_VERSION = "v2.7-experimental-score-clarified"
+SITE_LABEL = "Patient Self-Assessment · Research Preview"
 
 # ─────────────────────────────────────────────────────────────────────────
 # Load the backend module (2_fusion.py) from disk
 # ─────────────────────────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FUSION_PATH = os.path.join(_HERE, "2_fusion.py")
-_PENDING_SYNC_PATH = os.path.join(_HERE, "pending_sync.json")
+_LOCAL_DB_PATH = os.path.join(_HERE, "flareguard.db")
 
 try:
     _spec = importlib.util.spec_from_file_location("fusion_backend", _FUSION_PATH)
@@ -88,8 +92,8 @@ except Exception as exc:  # pragma: no cover - only hit if 2_fusion.py itself is
 st.set_page_config(
     page_title="RA FlareGuard",
     page_icon="🫀",
-    layout="centered",
-    initial_sidebar_state="collapsed",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 if fusion is None:
@@ -107,114 +111,149 @@ except Exception:
     _PLOTLY_OK = False
 
 # ─────────────────────────────────────────────────────────────────────────
-# Optional Supabase client — cloud audit log with retry + offline queue.
-# Never blocks the app: any failure here degrades to "local only", and
-# the payload is queued for a later automatic retry instead of being lost.
+# LOCAL SQLITE PERSISTENCE LAYER — zero-downtime replacement for the
+# previous cloud (Supabase) audit log. No network dependency: every
+# assessment is committed straight to a local database file that lives
+# next to this script. Every function here is defensive (never raises
+# into the UI) so a locked/corrupt DB file degrades to a readable error
+# banner instead of crashing the console mid-assessment.
 # ─────────────────────────────────────────────────────────────────────────
-_SUPABASE_CLIENT = None
-_SUPABASE_INIT_TRIED = False
+_PATIENT_ASSESSMENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS patient_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    patient_id TEXT,
+    pain_score INTEGER,
+    swollen_joint_count INTEGER,
+    tender_joint_count INTEGER,
+    rapid3_score REAL,
+    haq_di_score REAL,
+    predicted_flare_risk REAL,
+    risk_category TEXT
+)
+"""
+
+_PATIENT_PROFILES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS patient_profiles (
+    username TEXT PRIMARY KEY,
+    patient_id TEXT NOT NULL,
+    age INTEGER NOT NULL,
+    city TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
 
 
-def get_supabase_client():
-    """Lazily build a Supabase client from st.secrets. Returns None (and
-    logs, never raises) if the `supabase` package isn't installed or the
-    SUPABASE_URL / SUPABASE_KEY secrets aren't configured."""
-    global _SUPABASE_CLIENT, _SUPABASE_INIT_TRIED
-    if _SUPABASE_INIT_TRIED:
-        return _SUPABASE_CLIENT
-    _SUPABASE_INIT_TRIED = True
+def get_patient_profile(username: str) -> dict | None:
+    """Load the saved profile belonging to one registered account."""
+    if not username or username.startswith("guest_") or username == "viva_evaluator":
+        return None
+
+    conn = get_db_connection()
     try:
-        from supabase import create_client
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        _SUPABASE_CLIENT = create_client(url, key)
-        LOG.info("Supabase client initialised.")
-    except Exception as exc:
-        LOG.warning("Supabase unavailable, falling back to local-only persistence: %s", exc)
-        _SUPABASE_CLIENT = None
-    return _SUPABASE_CLIENT
+        row = conn.execute(
+            """
+            SELECT patient_id, age, city
+            FROM patient_profiles
+            WHERE username = ?
+            """,
+            (username.strip().lower(),),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "patient_id": row[0],
+            "age": int(row[1]),
+            "city": row[2],
+        }
+    finally:
+        conn.close()
 
 
-def _queue_pending_sync(payload: dict) -> None:
-    """Append a failed payload to the local pending_sync.json queue file
-    so nothing is lost on a Wi-Fi drop. Best-effort — if even the local
-    queue write fails, we log it and move on rather than crash the app."""
-    try:
-        queue = []
-        if os.path.isfile(_PENDING_SYNC_PATH):
-            try:
-                with open(_PENDING_SYNC_PATH, "r", encoding="utf-8") as f:
-                    queue = json.load(f)
-                if not isinstance(queue, list):
-                    queue = []
-            except Exception:
-                queue = []
-        queue.append(payload)
-        with open(_PENDING_SYNC_PATH, "w", encoding="utf-8") as f:
-            json.dump(queue, f, indent=2, default=str)
-    except Exception as exc:
-        LOG.error("Failed to write pending_sync.json queue: %s", exc)
-
-
-def _flush_pending_sync(client) -> int:
-    """Try to resend anything queued from a previous offline session.
-    Returns the number of records successfully flushed. Never raises."""
-    if client is None or not os.path.isfile(_PENDING_SYNC_PATH):
-        return 0
-    try:
-        with open(_PENDING_SYNC_PATH, "r", encoding="utf-8") as f:
-            queue = json.load(f)
-        if not isinstance(queue, list) or not queue:
-            return 0
-    except Exception as exc:
-        LOG.error("Failed to read pending_sync.json queue: %s", exc)
-        return 0
-
-    still_pending = []
-    flushed = 0
-    for payload in queue:
-        try:
-            client.table("patient_assessments").insert(payload).execute()
-            flushed += 1
-        except Exception as exc:
-            LOG.warning("Retry flush failed for a queued record: %s", exc)
-            still_pending.append(payload)
-
-    try:
-        if still_pending:
-            with open(_PENDING_SYNC_PATH, "w", encoding="utf-8") as f:
-                json.dump(still_pending, f, indent=2, default=str)
-        elif os.path.isfile(_PENDING_SYNC_PATH):
-            os.remove(_PENDING_SYNC_PATH)
-    except Exception as exc:
-        LOG.error("Failed to update pending_sync.json after flush: %s", exc)
-
-    return flushed
-
-
-def save_to_supabase(payload: dict, max_retries: int = 3, backoff_seconds: float = 0.6) -> bool:
-    """Insert one row into `patient_assessments` with bounded retry/backoff.
-    On total failure, queues the payload locally instead of dropping it.
-    Returns True only on a confirmed successful cloud insert."""
-    client = get_supabase_client()
-    if client is None:
-        _queue_pending_sync(payload)
+def save_patient_profile(username: str, patient_id: str, age: int, city: str) -> bool:
+    """Create or update a registered user's patient profile."""
+    if (
+        not username
+        or username.startswith("guest_")
+        or username == "viva_evaluator"
+    ):
         return False
 
-    last_exc = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            client.table("patient_assessments").insert(payload).execute()
-            return True
-        except Exception as exc:
-            last_exc = exc
-            LOG.warning("Supabase insert attempt %d/%d failed: %s", attempt, max_retries, exc)
-            if attempt < max_retries:
-                time.sleep(backoff_seconds * attempt)
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO patient_profiles
+                (username, patient_id, age, city, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(username) DO UPDATE SET
+                patient_id = excluded.patient_id,
+                age = excluded.age,
+                city = excluded.city,
+                updated_at = excluded.updated_at
+            """,
+            (
+                username.strip().lower(),
+                patient_id.strip(),
+                int(age),
+                city.strip(),
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+        return True
+    except Exception as exc:
+        LOG.error("Patient profile save failed: %s", exc)
+        return False
+    finally:
+        conn.close()
 
-    LOG.error("Supabase insert failed after %d attempts: %s", max_retries, last_exc)
-    _queue_pending_sync(payload)
-    return False
+
+def get_db_connection():
+    """One short-lived connection per call — SQLite handles this cheaply
+    and it avoids holding a connection open across Streamlit reruns."""
+    conn = sqlite3.connect(_LOCAL_DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")  # safer for concurrent Streamlit reruns
+    return conn
+
+
+
+def init_db() -> None:
+    conn = get_db_connection()
+    try:
+        conn.execute(_PATIENT_ASSESSMENTS_SCHEMA)
+        conn.execute(_PATIENT_PROFILES_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+
+def save_patient_record(data_dict: dict) -> bool:
+    """Commits one row to the local patient_assessments table.
+    `data_dict` keys map 1:1 onto the table's columns (any extra keys
+    are ignored; missing keys are stored as NULL). Returns True on a
+    confirmed commit, False on any failure — never raises."""
+    columns = [
+        "patient_id", "pain_score", "swollen_joint_count", "tender_joint_count",
+        "rapid3_score", "haq_di_score", "predicted_flare_risk", "risk_category",
+    ]
+    values = [data_dict.get(c) for c in columns]
+    placeholders = ", ".join("?" for _ in columns)
+    sql = f"INSERT INTO patient_assessments ({', '.join(columns)}) VALUES ({placeholders})"
+    try:
+        conn = get_db_connection()
+        try:
+            conn.execute(sql, values)
+            conn.commit()
+        finally:
+            conn.close()
+        return True
+    except Exception as exc:
+        LOG.error("Local SQLite insert into patient_assessments failed: %s", exc)
+        return False
 
 
 def get_device_viewport() -> str:
@@ -742,6 +781,209 @@ div[data-testid="element-container"]{ margin-bottom:0!important; }
 @media (prefers-reduced-motion: reduce){
   *{transition:none!important;animation:none!important}
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   FIX (login-page look): Streamlit wraps every text box in its own BaseWeb
+   container. The rules above styled only the inner <input>, so the outer
+   container kept the browser/OS theme (dark border + dark eye-icon box).
+   Style the wrapper too, and draw ONE clean border instead of two.
+   ═══════════════════════════════════════════════════════════════════════ */
+div[data-baseweb="input"],
+div[data-baseweb="textarea"]{
+  background:var(--card)!important;
+  border:1px solid var(--border2)!important;
+  border-radius:var(--radius-control)!important;
+  box-shadow:none!important;overflow:hidden;
+}
+div[data-baseweb="base-input"]{
+  background:transparent!important;border:none!important;box-shadow:none!important;
+}
+div[data-baseweb="input"] input,
+div[data-baseweb="textarea"] textarea{
+  background:transparent!important;border:none!important;box-shadow:none!important;
+}
+div[data-baseweb="input"] input:focus,
+div[data-baseweb="textarea"] textarea:focus{
+  border:none!important;box-shadow:none!important;
+}
+div[data-baseweb="input"]:focus-within,
+div[data-baseweb="textarea"]:focus-within{
+  border-color:var(--teal)!important;box-shadow:0 0 0 3px rgba(14,165,233,0.12)!important;
+}
+/* password show/hide (eye) button */
+.stTextInput div[data-baseweb="input"] button{
+  background:transparent!important;border:none!important;box-shadow:none!important;
+  color:var(--text2)!important;
+}
+.stTextInput div[data-baseweb="input"] button:hover{background:var(--surface)!important;color:var(--teal2)!important}
+
+/* Log In / Sign Up / Guest tabs: equal width, teal accent (was red default) */
+.stTabs [data-baseweb="tab-list"]{gap:6px!important;width:100%}
+.stTabs [data-baseweb="tab"]{flex:1 1 0!important;justify-content:center!important;padding:0 10px!important}
+.stTabs [data-baseweb="tab-highlight"]{background:var(--teal)!important}
+.stTabs [data-baseweb="tab-border"]{background:var(--border)!important}
+/* hide the empty card outlines left by wrapper <div>s opened in one st.markdown call and closed in another */
+.qcard:empty{display:none!important}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   READABILITY PASS — larger type, answer buttons that fill the row and line
+   up with the question text (they were flush-left while text had 24px inset)
+   ═══════════════════════════════════════════════════════════════════════ */
+div[data-testid="stRadio"]{width:100%!important;box-sizing:border-box;padding:0 24px!important}
+div[data-testid="stRadio"] > div[role="radiogroup"]{width:100%!important}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label{min-height:46px}
+div[data-testid="stRadio"] > div[role="radiogroup"] > label p{font-size:0.9rem!important}
+.nrs-wrap div[data-testid="stRadio"] div[role="radiogroup"] > label{min-height:46px}
+.nrs-wrap div[data-testid="stRadio"] div[role="radiogroup"] > label p{font-size:0.9rem!important}
+.q-text{font-size:1rem}
+.q-ref{font-size:0.74rem}
+.q-badge{font-size:0.74rem}
+.step-desc{font-size:0.95rem}
+.field-help{font-size:0.8rem}
+.scale-chip{font-size:0.78rem}
+.vas-ends{font-size:0.78rem}
+.prog-label,.prog-step{font-size:0.8rem}
+.step-eyebrow{font-size:0.74rem}
+@media (max-width:400px){
+  div[data-testid="stRadio"]{padding:0 12px!important}
+  div[data-testid="stRadio"] > div[role="radiogroup"] > label p{font-size:0.74rem!important}
+  .nrs-wrap div[data-testid="stRadio"] div[role="radiogroup"] > label p{font-size:0.78rem!important}
+}
+
+/* patient-facing simplification: hide clinical meta lines (citations stay in the results-page disclaimer) */
+.q-ref,.step-cite,.scale-chips{display:none!important}
+/* answer rows: Streamlit sizes st.radio to its content by default — make the row full width */
+[data-testid="stElementContainer"]:has([data-testid="stRadio"]),
+[data-testid="element-container"]:has([data-testid="stRadio"]){width:100%!important}
+div[data-testid="stRadio"] > div[role="radiogroup"]{overflow-x:visible!important}
+
+/* ── FlareGuard application-wide dashboard refresh ── */
+:root {
+  --bg: #F5F8FB;
+  --surface: #EDF3F7;
+  --card: #FFFFFF;
+  --border: #DCE6ED;
+  --border2: #C5D5DF;
+  --teal: #0F766E;
+  --teal2: #115E59;
+  --blue: #173B4D;
+  --text: #142C3A;
+  --text2: #526777;
+  --text3: #718493;
+  --focus: #0F766E;
+  --radius-card: 16px;
+  --shadow-card: 0 4px 18px rgba(23, 59, 77, 0.06);
+}
+.stApp {
+  background: #F5F8FB;
+}
+[data-testid="stHeader"] {
+  background: rgba(245,248,251,0.92);
+}
+[data-testid="stSidebar"] {
+  background: #173B4D;
+  border-right: 1px solid #254C5F;
+}
+[data-testid="stSidebar"] * {
+  color: #F0F7FA;
+}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+  color: #D6E5EC;
+}
+[data-testid="stSidebar"] div.stButton > button {
+  width: 100%;
+  text-align: left;
+  justify-content: flex-start;
+  min-height: 44px;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 10px;
+  background: rgba(255,255,255,0.055);
+  color: #F0F7FA;
+  font-weight: 600;
+}
+[data-testid="stSidebar"] div.stButton > button:hover {
+  border-color: #73D6C6;
+  background: rgba(115,214,198,0.14);
+  color: #FFFFFF;
+}
+[data-testid="stSidebar"] hr {
+  border-color: rgba(255,255,255,0.18);
+}
+[data-testid="stMainBlockContainer"] {
+  max-width: 1500px;
+  padding-top: 1.6rem;
+  padding-bottom: 3rem;
+}
+div[data-testid="stMetric"] {
+  background: #FFFFFF;
+  border: 1px solid #DCE6ED;
+  padding: 18px 20px;
+  border-radius: 15px;
+  box-shadow: 0 4px 18px rgba(23,59,77,0.04);
+}
+div[data-testid="stMetricLabel"] {
+  color: #526777;
+  font-weight: 600;
+}
+div[data-testid="stMetricValue"] {
+  color: #173B4D;
+}
+div[data-testid="stButton"] > button,
+div[data-testid="stFormSubmitButton"] > button {
+  border-radius: 10px;
+  min-height: 42px;
+  font-weight: 600;
+  transition: all 120ms ease;
+}
+div[data-testid="stTextInput"] input,
+div[data-testid="stNumberInput"] input,
+div[data-testid="stSelectbox"] div[role="combobox"],
+div[data-testid="stTextArea"] textarea {
+  border-radius: 10px;
+}
+div[data-testid="stTabs"] button {
+  font-weight: 600;
+}
+.fg-page-heading {
+  font-size: 1.9rem;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  color: #173B4D;
+  line-height: 1.2;
+}
+.fg-page-subtitle {
+  color: #647887;
+  margin-top: 6px;
+  margin-bottom: 22px;
+  font-size: 0.98rem;
+}
+.fg-panel {
+  background: #FFFFFF;
+  border: 1px solid #DCE6ED;
+  border-radius: 16px;
+  padding: 20px;
+  margin: 8px 0 16px;
+  box-shadow: 0 4px 18px rgba(23,59,77,0.04);
+}
+.fg-panel-title {
+  font-size: 1.05rem;
+  font-weight: 750;
+  color: #173B4D;
+  margin-bottom: 6px;
+}
+.fg-muted {
+  color: #647887;
+  font-size: 0.9rem;
+}
+@media (max-width: 768px) {
+  [data-testid="stMainBlockContainer"] {
+    padding: 1rem 0.8rem 2rem;
+  }
+  .fg-page-heading {
+    font-size: 1.55rem;
+  }
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -752,19 +994,33 @@ CITIES = fusion.CITIES
 RAPID3_Qs = fusion.RAPID3_QUESTIONS
 DIFF_SHORT = fusion.DIFFICULTY_SHORT
 TOTAL_STEPS = 6  # 0 Welcome · 1 Demographics · 2 RAPID3 · 3 DAS28 · 4 Lifestyle&Sensor · 5 Results
-STEP_NAMES = ["Welcome", "Demographics", "RAPID3 Survey", "DAS28 Markers", "Lifestyle & Sensor", "Results"]
+STEP_NAMES = ["Welcome", "Demographics", "Symptom Survey", "DAS28 Markers", "Lifestyle & Sensor", "Results"]
 
 # ─────────────────────────────────────────────────────────────────────────
-# Init backend resources (DB + models) — cached per Streamlit session,
-# guarded so a broken DB/model file shows a friendly message instead of
-# a raw traceback during a live demo.
+# Init backend resources (local DB + models) — cached per Streamlit
+# session, guarded so a broken DB/model file shows a friendly message
+# instead of a raw traceback during a live demo.
 # ─────────────────────────────────────────────────────────────────────────
 try:
-    fusion.init_db()
+    init_db()
     _DB_INIT_ERROR = None
 except Exception as exc:
     _DB_INIT_ERROR = f"{type(exc).__name__}: {exc}"
-    LOG.error("Local DB init failed: %s", _DB_INIT_ERROR)
+    LOG.error("Local flareguard.db init failed: %s", _DB_INIT_ERROR)
+
+if _DB_INIT_ERROR:
+    st.error(
+        "⚠️ **Local database could not be initialised.** Assessments can still be "
+        "completed, but results won't be saved to `flareguard.db` this session. "
+        f"(Technical detail logged: {_DB_INIT_ERROR})"
+    )
+
+# fusion's own local history mechanism (existing patient-account feature —
+# unrelated to and unaffected by the flareguard.db audit table above).
+try:
+    fusion.init_db()
+except Exception as exc:
+    LOG.error("fusion.init_db() failed: %s", exc)
 
 
 @st.cache_resource(show_spinner=False)
@@ -790,14 +1046,6 @@ if _MODEL_INIT_ERROR:
         "fill in the assessment, but the flare-risk forecast may be unavailable. "
         f"(Technical detail logged: {_MODEL_INIT_ERROR})"
     )
-
-# Try to flush any records left over from a previous offline session,
-# once per Streamlit session (not on every rerun).
-if "sync_flush_attempted" not in st.session_state:
-    st.session_state.sync_flush_attempted = True
-    _flushed_ct = _flush_pending_sync(get_supabase_client())
-    if _flushed_ct:
-        st.session_state["_flush_notice"] = _flushed_ct
 
 # ─────────────────────────────────────────────────────────────────────────
 # Tap-to-select pill widgets — every widget is bound directly to a
@@ -899,9 +1147,9 @@ def scoreboard():
     r3style = r3_style(r3)
     st.markdown(f"""
     <div class="live-ticker">
-      <span>🧮 HAQ-DI Function&nbsp;<b>{fn_score:.1f}/10</b></span>
+      <span>🧮 Function score (prototype)&nbsp;<b>{fn_score:.1f}/10</b></span>
       <span>🎚 Pain VAS&nbsp;<b>{p:.1f}/10</b></span>
-      <span>📊 RAPID3&nbsp;<b style="color:{r3style['text']}">{r3:.1f}/30 · {r3style['label']}</b></span>
+      <span>📊 Prototype score&nbsp;<b style="color:{r3style['text']}">{r3:.1f}/30 · {r3style['label']}</b></span>
       <span class="autosave-tag"><span class="autosave-dot"></span>Auto-saved</span>
     </div>""", unsafe_allow_html=True)
 
@@ -911,9 +1159,10 @@ def run_assessment():
     weather (with automatic fallback), fuses the multimodal risk models,
     projects a 3-day-ahead trend, computes the optional DAS28 score, stores
     everything the Step-5 dashboard needs into st.session_state.results,
-    persists to local history, and mirrors the record to Supabase with
-    retry + offline-queue fallback. Every external call is wrapped so a
-    single failure degrades gracefully instead of crashing the live demo."""
+    persists to fusion's local history, and commits the audit record to
+    the local `flareguard.db` SQLite database. Every external call is
+    wrapped so a single failure degrades gracefully instead of crashing
+    the live demo."""
     t_start = time.monotonic()
 
     # Defensive re-clamp — belt-and-braces before anything reaches the models.
@@ -939,7 +1188,7 @@ def run_assessment():
     )
 
     try:
-        with st.spinner("Fetching live weather & computing your forecast…"):
+        with st.spinner("Fetching weather information and calculating the experimental score…"):
             wx_today = weather_client.current(st.session_state.city)
             wx_forecast = weather_client.forecast(st.session_state.city, days=3)
 
@@ -979,7 +1228,7 @@ def run_assessment():
                 contribs.append(fcontrib)
     except Exception as exc:
         st.error(
-            "⚠️ We couldn't complete your forecast right now — this is usually a temporary "
+            "⚠️ We couldn't calculate the experimental score right now — this may be a temporary "
             "weather-service or connectivity issue. Please try again in a moment."
         )
         LOG.error("Forecast/risk computation failed: %s", exc)
@@ -994,10 +1243,12 @@ def run_assessment():
         fn_score=fn_score, r3=r3, das28=das,
         pain=st.session_state.pain, gs=st.session_state.global_s, fatigue=st.session_state.fatigue,
         risks=risks, weathers=weathers, contributions=contribs[peak_idx], peak_idx=peak_idx,
-        synced_to_cloud=False, submission_latency_ms=submission_latency_ms,
+        saved_to_db=False, submission_latency_ms=submission_latency_ms,
     )
 
-    # Primary persistence — local history (existing patient-account feature).
+    # Primary persistence — fusion's own local history (existing
+    # patient-account "Previous Scores" feature — a separate store from
+    # the flareguard.db audit table below).
     try:
         fusion.save_assessment(
             st.session_state.username, st.session_state.city, r3, fn_score,
@@ -1005,14 +1256,11 @@ def run_assessment():
         )
     except Exception as exc:
         LOG.error("Local save_assessment failed: %s", exc)
-        st.warning("Your forecast is ready, but we couldn't save it to your local history right now.")
+        st.warning("Your assessment is ready, but we couldn't save it to your local history right now.")
 
-    # Secondary, cloud audit log — Supabase, with retry + offline queue and
-    # a full clinical-audit metadata envelope.
+    # Local SQLite audit record — zero-downtime, no cloud provider needed.
     try:
-        payload = dict(
-            id=str(uuid.uuid4()),
-            created_at=datetime.now(timezone.utc).isoformat(),
+        record = dict(
             patient_id=st.session_state.patient_id,
             pain_score=int(round(st.session_state.pain)),
             swollen_joint_count=int(st.session_state.das_sjc),
@@ -1021,15 +1269,17 @@ def run_assessment():
             haq_di_score=float(fn_score),
             predicted_flare_risk=float(peak_risk),
             risk_category=level,
-            app_version=APP_VERSION,
-            client_timestamp_utc=datetime.now(timezone.utc).isoformat(),
-            submission_latency_ms=submission_latency_ms,
-            device_viewport=get_device_viewport(),
         )
-        st.session_state.results["synced_to_cloud"] = save_to_supabase(payload)
+        st.session_state.results["saved_to_db"] = save_patient_record(record)
     except Exception as exc:
-        LOG.error("Supabase payload build failed: %s", exc)
-        st.session_state.results["synced_to_cloud"] = False
+        LOG.error("flareguard.db payload build failed: %s", exc)
+        st.session_state.results["saved_to_db"] = False
+
+    if not st.session_state.results["saved_to_db"]:
+        st.warning(
+            "Your assessment is ready, but we couldn't commit this assessment to the local "
+            "database (`flareguard.db`) right now. The rest of your results below are unaffected."
+        )
 
 
 def enter_demo_mode():
@@ -1078,15 +1328,8 @@ st.markdown(f"""
 <div class="env-banner">
   <span>{SITE_LABEL}</span>
   <span class="sep">·</span>
-  <span>Build <b>{APP_VERSION}</b></span>
+  <span>Experimental tool · Not a medical diagnosis</span>
 </div>""", unsafe_allow_html=True)
-
-if st.session_state.get("_flush_notice"):
-    st.success(
-        f"☁️ Reconnected — {st.session_state['_flush_notice']} previously offline "
-        "record(s) have now synced to the cloud audit log."
-    )
-    del st.session_state["_flush_notice"]
 
 # ─────────────────────────────────────────────────────────────────────────
 # AUTH GATE — login / sign up / guest / quick viva demo
@@ -1101,54 +1344,118 @@ def render_auth_gate():
         </div>
         <div style="font-family:'Inter',sans-serif;font-weight:800;font-size:1.9rem;color:var(--text);
              line-height:1.2;letter-spacing:-0.01em">
-          Know your flare risk<br><span style="color:var(--teal2)">3 days ahead</span>
+          Understand your symptoms<br><span style="color:var(--teal2)">Track changes over time</span>
         </div>
       </div>
     </div>""", unsafe_allow_html=True)
 
-    st.markdown('<div class="auth-wrap" style="padding-top:0">', unsafe_allow_html=True)
-    st.markdown("""
-    <div class="demo-banner">
-      <span>🎓 <b>Evaluator / Viva panel?</b> Skip login and jump straight to a fully
-      populated results dashboard with sample patient data.</span>
-    </div>""", unsafe_allow_html=True)
-    if st.button("⚡ Quick Viva / Evaluator Demo Mode", type="primary", use_container_width=True):
+    st.markdown(
+        '<div class="auth-wrap" style="padding-top:0">',
+        unsafe_allow_html=True,
+    )
+
+    if st.button(
+        "⚡ Evaluator Demo Mode",
+        type="primary",
+        use_container_width=True,
+    ):
         enter_demo_mode()
         st.rerun()
+
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="auth-wrap" style="padding-top:0">', unsafe_allow_html=True)
-    tab_login, tab_signup, tab_guest = st.tabs(["Log In", "Sign Up", "Continue as Guest"])
+    st.markdown(
+        '<div class="auth-wrap" style="padding-top:0">',
+        unsafe_allow_html=True,
+    )
 
+    tab_login, tab_signup, tab_guest = st.tabs(
+        ["Log In", "Sign Up", "Continue as Guest"]
+    )
+
+    # ── Login ───────────────────────────────────────────────────────────
     with tab_login:
         with st.form("login_form"):
             u = st.text_input("Username")
             p = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Log In", type="primary", use_container_width=True)
+
+            submitted = st.form_submit_button(
+                "Log In",
+                type="primary",
+                use_container_width=True,
+            )
+
             if submitted:
                 try:
                     ok, msg = fusion.verify_user(u, p)
                 except Exception as exc:
-                    ok, msg = False, "Login is temporarily unavailable — please try again shortly."
+                    ok = False
+                    msg = (
+                        "Login is temporarily unavailable — "
+                        "please try again shortly."
+                    )
                     LOG.error("verify_user failed: %s", exc)
+
                 if ok:
+                    username = u.strip().lower()
+
                     st.session_state.authenticated = True
                     st.session_state.demo_mode = False
-                    st.session_state.username = u.strip().lower()
+                    st.session_state.username = username
                     st.session_state.display_name = msg
+
+                    # Clear stale patient details and widget values.
+                    for key in list(st.session_state.keys()):
+                        if (
+                            key in {
+                                "patient_id",
+                                "age",
+                                "city",
+                                "results",
+                            }
+                            or key.startswith("w_")
+                        ):
+                            del st.session_state[key]
+
+                    # Restore the profile saved for this account.
+                    try:
+                        profile = get_patient_profile(username)
+
+                        if profile:
+                            st.session_state.patient_id = profile["patient_id"]
+                            st.session_state.age = profile["age"]
+                            st.session_state.city = profile["city"]
+
+                    except Exception as exc:
+                        LOG.error(
+                            "Could not restore patient profile: %s",
+                            exc,
+                        )
+
                     st.success(f"Welcome back, {msg}!")
                     st.rerun()
+
                 else:
                     st.error(msg)
-        st.caption("Logging in lets us remember your previous RAPID3 scores between visits.")
 
+        st.caption(
+            "Log in to access your saved assessment history and patient profile."
+        )
+
+    # ── Sign up ─────────────────────────────────────────────────────────
     with tab_signup:
         with st.form("signup_form"):
             su = st.text_input("Choose a username")
             sn = st.text_input("Display name (optional)")
             sp = st.text_input("Choose a password", type="password")
             sp2 = st.text_input("Confirm password", type="password")
-            submitted = st.form_submit_button("Create Account", type="primary", use_container_width=True)
+
+            submitted = st.form_submit_button(
+                "Create Account",
+                type="primary",
+                use_container_width=True,
+            )
+
             if submitted:
                 if sp != sp2:
                     st.error("Passwords do not match.")
@@ -1156,33 +1463,59 @@ def render_auth_gate():
                     try:
                         ok, msg = fusion.create_user(su, sp, sn)
                     except Exception as exc:
-                        ok, msg = False, "Account creation is temporarily unavailable — please try again shortly."
+                        ok = False
+                        msg = (
+                            "Account creation is temporarily unavailable — "
+                            "please try again shortly."
+                        )
                         LOG.error("create_user failed: %s", exc)
+
                     if ok:
-                        st.success(msg + " Please log in from the 'Log In' tab.")
+                        st.success(
+                            msg + " Please log in from the 'Log In' tab."
+                        )
                     else:
                         st.error(msg)
 
+    # ── Guest access ────────────────────────────────────────────────────
     with tab_guest:
         st.markdown(
             '<p style="font-size:0.8rem;color:var(--text2);margin-bottom:10px">'
-            "Try the full assessment without creating an account. Your results won't be "
-            "saved to a personal history, but you'll still see the complete dashboard.</p>",
+            "Try the assessment without creating an account. Guest results are not "
+            "linked to your registered account history.</p>",
             unsafe_allow_html=True,
         )
-        if st.button("Continue as Guest →", use_container_width=True):
+
+        if st.button(
+            "Continue as Guest →",
+            use_container_width=True,
+        ):
+            # Clear values left by another account or previous session.
+            for key in list(st.session_state.keys()):
+                if (
+                    key in {
+                        "patient_id",
+                        "age",
+                        "city",
+                        "results",
+                    }
+                    or key.startswith("w_")
+                ):
+                    del st.session_state[key]
+
             st.session_state.authenticated = True
             st.session_state.demo_mode = False
             st.session_state.username = f"guest_{secrets_token()}"
             st.session_state.display_name = "Guest"
+
             st.rerun()
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 
 if not st.session_state.authenticated:
     render_auth_gate()
     st.stop()
-
 # ─────────────────────────────────────────────────────────────────────────
 # Demo-mode banner (persists across all steps once active)
 # ─────────────────────────────────────────────────────────────────────────
@@ -1190,7 +1523,7 @@ if st.session_state.demo_mode:
     st.markdown("""
     <div style="padding:10px 24px 0">
       <div class="demo-banner">
-        <span>⚡ <b>Quick Viva Demo Mode</b> — showing a pre-populated sample assessment.</span>
+        <span>⚡ <b>Demo Mode</b> — showing a pre-populated sample assessment.</span>
       </div>
     </div>""", unsafe_allow_html=True)
 
@@ -1198,23 +1531,34 @@ if st.session_state.demo_mode:
 # Session-safety controls — visible once authenticated, on every step,
 # so a clinician can end a consultation and wipe patient state at any time.
 # ─────────────────────────────────────────────────────────────────────────
-_sig_col1, _sig_col2 = st.columns([4, 1])
+_sig_col1, _sig_col2, _sig_col3 = st.columns([4, 1.35, 1])
 with _sig_col1:
     st.markdown(
-        f'<div style="padding:8px 24px 0;font-size:0.7rem;color:var(--text3)">'
-        f'Signed in as <b style="color:var(--text2)">{st.session_state.display_name or st.session_state.username}</b></div>',
+        f'<div style="padding:8px 8px 0;font-size:0.85rem;color:var(--text3)">'
+        f'Account: <b style="color:var(--text2)">{st.session_state.display_name or st.session_state.username}</b></div>',
         unsafe_allow_html=True)
 with _sig_col2:
-    st.markdown('<div style="padding:8px 24px 0">', unsafe_allow_html=True)
-    if st.button("🧹 Clear Session", key="clear_session_top", help="End this consultation and wipe patient data from memory"):
+    if st.button("🧹 Clear Session", key="clear_session_top", help="Clear the current answers without logging out", use_container_width=True):
         st.session_state["_confirm_clear_top"] = True
-    st.markdown('</div>', unsafe_allow_html=True)
+with _sig_col3:
+    if st.button("↪ Log out", key="logout_top", help="Log out and return to the welcome screen", use_container_width=True):
+        # Clear clinical and identity state so another person using this
+        # browser session cannot inherit the previous participant's answers.
+        for _key in list(st.session_state.keys()):
+            if _key not in {"_streamlit_run_id"}:
+                del st.session_state[_key]
+        st.session_state.authenticated = False
+        st.session_state.demo_mode = False
+        st.session_state.username = None
+        st.session_state.display_name = None
+        init_session()
+        st.rerun()
 
 if st.session_state.get("_confirm_clear_top"):
     st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
     st.warning(
         "This clears the current patient's answers and results from this device's memory "
-        "(local history and any synced cloud record are unaffected). Continue?"
+        "(records already committed to flareguard.db are unaffected). Continue?"
     )
     cc1, cc2 = st.columns(2)
     with cc1:
@@ -1229,6 +1573,434 @@ if st.session_state.get("_confirm_clear_top"):
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────
+# FLAREGUARD APP SHELL — dashboard, previous sessions, trends and profile
+# ─────────────────────────────────────────────────────────────────────────
+def fg_load_history():
+    """Read the existing account history without changing its storage."""
+    username = st.session_state.get("username")
+    if not username:
+        return []
+
+    try:
+        rows = fusion.get_history(username) or []
+    except Exception as exc:
+        LOG.error("Dashboard history retrieval failed: %s", exc)
+        return []
+
+    parsed = []
+    for row in rows:
+        try:
+            created_at, city, rapid3, risk, level = row[:5]
+            parsed.append({
+                "created_at": str(created_at or ""),
+                "city": str(city or ""),
+                "rapid3": float(rapid3 or 0),
+                "risk": float(risk or 0),
+                "level": str(level or "Unknown"),
+            })
+        except (TypeError, ValueError, IndexError):
+            continue
+
+    # Timestamps are stored as ISO-like strings by the existing history feature.
+    parsed.sort(key=lambda item: item["created_at"], reverse=True)
+    return parsed
+
+
+def fg_heading(title, subtitle):
+    st.markdown(
+        f'<div class="fg-page-heading">{title}</div>'
+        f'<div class="fg-page-subtitle">{subtitle}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def fg_render_dashboard():
+    username = st.session_state.get("username") or ""
+    display_name = st.session_state.get("display_name") or username or "Patient"
+    patient_id = st.session_state.get("patient_id") or "Not assigned yet"
+    city = st.session_state.get("city") or "Not set"
+    history = fg_load_history()
+
+    fg_heading(
+        f"Welcome back, {display_name}",
+        "Your personal RA monitoring space. Review your history or start a new assessment.",
+    )
+
+    left, right = st.columns([3, 1])
+    with left:
+        st.markdown(
+            '<div class="fg-panel">'
+            '<div class="fg-panel-title">Your health, at a glance</div>'
+            '<div class="fg-muted">Track your reported symptoms and experimental flare-risk scores over time.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    with right:
+        st.markdown(
+            '<div class="fg-panel">'
+            '<div class="fg-panel-title">Patient record</div>'
+            f'<div><b>{patient_id}</b></div>'
+            f'<div class="fg-muted">{city}</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    latest = history[0] if history else None
+    m1, m2, m3, m4 = st.columns(4)
+
+    with m1:
+        st.metric("Saved assessments", len(history))
+    with m2:
+        st.metric(
+            "Latest prototype score",
+            f'{latest["rapid3"]:.1f}/30' if latest else "—",
+        )
+    with m3:
+        st.metric(
+            "Latest recorded risk",
+            f'{latest["risk"]:.0%}' if latest else "—",
+        )
+    with m4:
+        st.metric("Profile city", city)
+
+    st.markdown("### Quick actions")
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        if st.button("＋  Start new assessment", type="primary",
+                     use_container_width=True, key="dash_new_assessment"):
+            st.session_state.app_view = "New Assessment"
+            st.session_state.step = 0
+            st.session_state.results = None
+            st.rerun()
+    with a2:
+        if st.button("▤  Previous sessions", use_container_width=True,
+                     key="dash_previous_sessions"):
+            st.session_state.app_view = "Previous Sessions"
+            st.rerun()
+    with a3:
+        if st.button("↗  View risk trends", use_container_width=True,
+                     key="dash_risk_trends"):
+            st.session_state.app_view = "Risk Trends"
+            st.rerun()
+
+    st.markdown("### Recent assessments")
+    if history:
+        recent = history[:5]
+        table = []
+        for item in recent:
+            try:
+                date_label = datetime.fromisoformat(
+                    item["created_at"]
+                ).strftime("%d %b %Y, %H:%M")
+            except Exception:
+                date_label = item["created_at"] or "Date unavailable"
+
+            table.append({
+                "Date": date_label,
+                "City": item["city"],
+                "RAPID3": f'{item["rapid3"]:.1f}/30',
+                "Experimental risk": f'{item["risk"]:.0%}',
+                "Category": item["level"].title(),
+            })
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.caption(
+            "Risk values are experimental research scores, not clinically validated "
+            "probabilities. Historical scores do not replace medical advice."
+        )
+    else:
+        st.info(
+            "No previous assessments are available in the account history yet. "
+            "Complete an assessment while signed in to start building your history."
+        )
+
+
+def fg_render_history():
+    if st.button("← Back to Dashboard", key="fg_back_history", use_container_width=False):
+        st.session_state.app_view = "Dashboard"
+        st.rerun()
+    st.write("")
+    history = fg_load_history()
+    fg_heading(
+        "Previous Sessions",
+        "Review assessments saved to your existing patient-account history.",
+    )
+
+    if not history:
+        st.info(
+            "No saved sessions were found for this account. If you expected to see "
+            "older records, they may be stored in a different local history database."
+        )
+        return
+
+    st.markdown(
+        f'<div class="fg-panel"><div class="fg-panel-title">'
+        f'{len(history)} saved assessment(s)</div>'
+        '<div class="fg-muted">Showing the history currently returned by your account history store.</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    table = []
+    for item in history:
+        try:
+            date_label = datetime.fromisoformat(
+                item["created_at"]
+            ).strftime("%d %b %Y, %H:%M")
+        except Exception:
+            date_label = item["created_at"] or "Date unavailable"
+
+        table.append({
+            "Date": date_label,
+            "City": item["city"],
+            "Prototype score": f'{item["rapid3"]:.1f}/30',
+            "Experimental score": f'{item["risk"]:.0%}',
+            "Risk category": item["level"].title(),
+        })
+
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.warning(
+        "Research prototype: historical risk scores are experimental and are not "
+        "clinically validated probabilities or a substitute for rheumatology care."
+    )
+
+
+def fg_render_trends():
+    if st.button("← Back to Dashboard", key="fg_back_trends", use_container_width=False):
+        st.session_state.app_view = "Dashboard"
+        st.rerun()
+    st.write("")
+    history = fg_load_history()
+    fg_heading(
+        "Risk Trends",
+        "Explore changes in recorded Prototype scores and experimental risk estimates.",
+    )
+
+    if not history:
+        st.info("Complete and save an assessment to begin viewing trends.")
+        return
+
+    chronological = list(reversed(history))
+    m1, m2 = st.columns(2)
+    with m1:
+        st.metric("Assessments available", len(chronological))
+    with m2:
+        st.metric("Most recent risk", f'{history[0]["risk"]:.0%}')
+
+    st.markdown("### Experimental risk over saved sessions")
+    st.line_chart(
+        {"Risk (%)": [item["risk"] * 100 for item in chronological]},
+        y_label="Experimental score (%)",
+        x_label="Saved sessions (oldest to newest)",
+    )
+
+    st.markdown("### Prototype score history")
+    st.line_chart(
+        {"RAPID3": [item["rapid3"] for item in chronological]},
+        y_label="Prototype score",
+        x_label="Saved sessions (oldest to newest)",
+    )
+
+    st.caption(
+        "Each point represents a saved assessment, not a daily continuous measurement. "
+        "These charts describe recorded history; they do not establish a clinical trend "
+        "or validate the risk model."
+    )
+
+
+def fg_render_profile():
+    if st.button("← Back to Dashboard", key="fg_back_profile", use_container_width=False):
+        st.session_state.app_view = "Dashboard"
+        st.rerun()
+    st.write("")
+    username = st.session_state.get("username") or ""
+    display_name = st.session_state.get("display_name") or username or "Patient"
+    profile = None
+
+    if username and not username.startswith("guest_") and username != "viva_evaluator":
+        try:
+            profile = get_patient_profile(username)
+        except Exception as exc:
+            LOG.error("Profile display failed: %s", exc)
+
+    fg_heading(
+        "My Profile",
+        "View the account and patient-record information currently available in this session.",
+    )
+
+    patient_id = (
+        profile.get("patient_id") if profile
+        else st.session_state.get("patient_id") or "Not assigned yet"
+    )
+    age = profile.get("age") if profile else st.session_state.get("age") or "Not provided"
+    city = profile.get("city") if profile else st.session_state.get("city") or "Not provided"
+
+    st.markdown('<div class="fg-panel">', unsafe_allow_html=True)
+    p1, p2 = st.columns(2)
+    with p1:
+        st.markdown("**Account display name**")
+        st.write(display_name)
+        st.markdown("**Username**")
+        st.write(username or "Guest session")
+    with p2:
+        st.markdown("**Patient ID**")
+        st.write(patient_id)
+        st.markdown("**Age**")
+        st.write(age)
+        st.markdown("**City / town**")
+        st.write(city)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if st.session_state.get("demo_mode"):
+        st.info("Demo mode is active. The displayed details may be sample data.")
+
+    st.caption(
+        "Profile details are displayed from the existing session/profile store. "
+        "This page does not edit or overwrite your saved profile."
+    )
+
+
+def fg_render_app_navigation():
+    st.session_state.setdefault("app_view", "Dashboard")
+    allowed_views = {
+        "Dashboard", "New Assessment", "Previous Sessions", "Risk Trends", "My Profile"
+    }
+    if st.session_state.app_view not in allowed_views:
+        st.session_state.app_view = "Dashboard"
+
+    with st.sidebar:
+        st.markdown("## 🫀 FlareGuard")
+        st.caption("RA monitoring · Research prototype")
+        st.divider()
+
+        st.markdown("**WORKSPACE**")
+        items = [
+            ("Dashboard", "⌂  Dashboard"),
+            ("New Assessment", "＋  New Assessment"),
+            ("Previous Sessions", "▤  Previous Sessions"),
+            ("Risk Trends", "↗  Risk Trends"),
+            ("My Profile", "◉  My Profile"),
+        ]
+
+        for view_name, label in items:
+            if st.button(
+                label,
+                key=f"fg_nav_{view_name.lower().replace(' ', '_')}",
+                use_container_width=True,
+                type="primary" if st.session_state.app_view == view_name else "secondary",
+            ):
+                if view_name == "New Assessment":
+                    st.session_state.step = 0
+                    st.session_state.results = None
+                st.session_state.app_view = view_name
+                st.rerun()
+
+        st.divider()
+        st.caption(
+            f"Signed in: {st.session_state.get('display_name') or st.session_state.get('username') or 'Patient'}"
+        )
+        st.caption("Experimental score · Not for medical decisions")
+
+    view = st.session_state.app_view
+
+    if view == "Dashboard":
+        fg_render_dashboard()
+        st.stop()
+    elif view == "Previous Sessions":
+        fg_render_history()
+        st.stop()
+    elif view == "Risk Trends":
+        fg_render_trends()
+        st.stop()
+    elif view == "My Profile":
+        fg_render_profile()
+        st.stop()
+
+    # Only the New Assessment view reaches the original six-step workflow.
+    if view == "New Assessment":
+        return
+
+    st.session_state.app_view = "Dashboard"
+    fg_render_dashboard()
+    st.stop()
+
+
+
+# Readability improvements for the complete application
+st.markdown("""
+<style>
+html, body, [class*="css"] {
+    font-size: 16px !important;
+}
+[data-testid="stAppViewContainer"] {
+    background: #F5F8FC !important;
+    color: #172B3A !important;
+}
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li {
+    color: #263B4A !important;
+    font-size: 1rem !important;
+    line-height: 1.65 !important;
+}
+[data-testid="stMarkdownContainer"] h1 {
+    color: #173B4D !important;
+    font-size: 2rem !important;
+    font-weight: 750 !important;
+}
+[data-testid="stMarkdownContainer"] h2 {
+    color: #173B4D !important;
+    font-size: 1.55rem !important;
+    font-weight: 700 !important;
+}
+[data-testid="stMarkdownContainer"] h3 {
+    color: #173B4D !important;
+    font-size: 1.2rem !important;
+    font-weight: 700 !important;
+}
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p {
+    color: #526777 !important;
+    font-size: 0.88rem !important;
+}
+[data-testid="stSidebar"] {
+    background: #FFFFFF !important;
+}
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] span {
+    color: #243B4A !important;
+}
+[data-testid="stButton"] button {
+    min-height: 42px !important;
+    font-size: 0.96rem !important;
+    font-weight: 650 !important;
+    border-radius: 10px !important;
+}
+[data-testid="stMetricLabel"] {
+    color: #425969 !important;
+    font-size: 0.92rem !important;
+}
+[data-testid="stMetricValue"] {
+    color: #173B4D !important;
+    font-size: 1.8rem !important;
+    font-weight: 750 !important;
+}
+[data-testid="stDataFrame"] {
+    border: 1px solid #D5E0E8 !important;
+    border-radius: 10px !important;
+}
+input, textarea, [data-baseweb="select"] {
+    font-size: 1rem !important;
+}
+button:focus-visible, input:focus-visible {
+    outline: 3px solid #087E8B !important;
+    outline-offset: 2px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+fg_render_app_navigation()
+
 # Progress bar
 # ─────────────────────────────────────────────────────────────────────────
 step = st.session_state.step
@@ -1282,64 +2054,33 @@ def nav(back=True, next_label="Continue →", next_fn=None, back_step=None, next
 # STEP 0 — WELCOME
 # ══════════════════════════════════════════════════════════════════════════
 if step == 0:
-    model_badge = (
-        '<span class="model-status ok">✓ All ML models loaded</span>' if MODELS_OK else
-        f'<span class="model-status fallback">⚠ {len(MODELS.load_errors) if MODELS else "?"} model(s) using calibrated fallback</span>'
-    )
-    st.markdown(f"""
+    model_badge = '<span class="model-status fallback">🧪 Research prototype · ML fusion not validated</span>'
+    st.markdown("""
     <div class="step-wrap" style="padding-top:10px">
-      <div style="text-align:center;padding:10px 0 16px">
-        <div style="font-size:0.62rem;font-weight:700;text-transform:uppercase;
-             letter-spacing:0.16em;color:var(--teal2);margin-bottom:8px">
-          RA FlareGuard · Sri Lanka
-        </div>
-        <div style="font-family:'Inter',sans-serif;font-weight:800;font-size:1.7rem;color:var(--text);
+      <div style="text-align:center;padding:10px 0 14px">
+        <div style="font-size:0.74rem;font-weight:700;text-transform:uppercase;
+             letter-spacing:0.16em;color:var(--teal2);margin-bottom:8px">RA FlareGuard · Sri Lanka</div>
+        <div style="font-family:'Inter',sans-serif;font-weight:800;font-size:1.8rem;color:var(--text);
              line-height:1.2;margin-bottom:10px;letter-spacing:-0.01em">
-          Know your flare risk<br><span style="color:var(--teal2)">3 days ahead</span>
+          Understand your symptoms<br><span style="color:var(--teal2)">one step at a time</span>
         </div>
-        <div style="font-size:0.8rem;color:var(--text2);line-height:1.6;
-             max-width:420px;margin:0 auto 14px">
-          Answer a short clinically validated questionnaire and get a
-          personalised 3-day flare risk forecast — including live Sri Lankan
-          weather conditions.
-        </div>
-        <div style="display:flex;gap:7px;justify-content:center;flex-wrap:wrap;margin-bottom:12px">
-          <span class="chip">⚕️ RAPID3 / MDHAQ</span>
-          <span class="chip">📊 HAQ-DI validated</span>
-          <span class="chip">🦴 DAS28 markers</span>
-          <span class="chip">🌤 Live weather</span>
-          <span class="chip">🤖 ML models</span>
-        </div>
-        <div style="margin-bottom:16px">{model_badge}</div>
-      </div>
-      <div class="qcard" style="padding:12px 16px">
-        <div class="qcard-hdr" style="margin-bottom:8px">What to expect</div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-          <div style="background:var(--surface);border:1px solid var(--border);
-               border-radius:8px;padding:10px 12px;font-size:0.72rem;color:var(--text2)">
-            <b style="color:var(--text)">⏱ 3–5 minutes</b><br>to complete
-          </div>
-          <div style="background:var(--surface);border:1px solid var(--border);
-               border-radius:8px;padding:10px 12px;font-size:0.72rem;color:var(--text2)">
-            <b style="color:var(--text)">📋 5 sections</b><br>step by step
-          </div>
-          <div style="background:var(--surface);border:1px solid var(--border);
-               border-radius:8px;padding:10px 12px;font-size:0.72rem;color:var(--text2)">
-            <b style="color:var(--text)">🗓 3-day forecast</b><br>with live weather
-          </div>
-          <div style="background:var(--surface);border:1px solid var(--border);
-               border-radius:8px;padding:10px 12px;font-size:0.72rem;color:var(--text2)">
-            <b style="color:var(--text)">🔬 Clinical standard</b><br>RAPID3 / HAQ-DI / DAS28
-          </div>
+        <div style="font-size:1rem;color:var(--text2);line-height:1.6;max-width:440px;margin:0 auto">
+          Tell us how you have been feeling and how symptoms affect your daily life.
+          Your answers create a research assessment to help you review your symptoms.
         </div>
       </div>
-      <div class="privacy-banner">
-        🔒 <b>De-identified by design.</b> This tool never asks for your real name — only a
-        self-chosen Patient ID / Subject Code that you control.
+      <div class="qcard" style="padding:14px 18px">
+        <div class="qcard-hdr" style="margin-bottom:10px">What you will fill in</div>
+        <div style="font-size:1rem;color:var(--text);line-height:1.5">
+          <div style="padding:7px 0;border-bottom:1px solid var(--border)"><b>1.</b> A code (not your name), your age and your town</div>
+          <div style="padding:7px 0;border-bottom:1px solid var(--border)"><b>2.</b> 10 daily-activity questions &mdash; tap one answer each</div>
+          <div style="padding:7px 0;border-bottom:1px solid var(--border)"><b>3.</b> Your pain and overall feeling, from 0 to 10</div>
+          <div style="padding:7px 0;border-bottom:1px solid var(--border)"><b>4.</b> Doctor's numbers <span style="color:var(--text3)">(optional &mdash; skip if you don't have them)</span></div>
+          <div style="padding:7px 0"><b>5.</b> Sleep, tiredness, recent flares and pulse</div>
+        </div>
       </div>
-      <div class="field-help" style="margin-top:6px">
-        💾 Every answer auto-saves as you go — an accidental refresh or app crash mid-form
-        will not lose what you've already entered.
+      <div class="field-help" style="margin-top:10px;font-size:0.85rem;text-align:center">
+        &#128274; We never ask for your name. Your answers save automatically on this device.
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1351,28 +2092,52 @@ if step == 0:
 elif step == 1:
     st.markdown("""
     <div class="step-wrap">
-      <div class="step-eyebrow">Section 01 · Patient Demographics &amp; Anonymized Baseline</div>
-      <div class="step-title">About <em>this record</em></div>
-      <div class="step-desc">Just a de-identified baseline so we can personalise your forecast and fetch live weather for your area.</div>
+      <div class="step-eyebrow">STEP 1 OF 5 · ABOUT YOU</div>
+      <div class="step-title">Let’s start <em>with you</em></div>
+      <div class="step-desc">Three quick details so we can personalise your forecast and check the weather in your area.</div>
     </div>""", unsafe_allow_html=True)
 
     with st.container():
         st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
-        st.markdown("""
-        <div class="privacy-banner">
-          🔒 <b>Do not enter your real name or national ID.</b> Use a de-identified code
-          only you (or your clinician) can map back to your identity — e.g.
-          <code>PATIENT_001</code>. Letters, numbers, <code>_</code> and <code>-</code> only, 3–40 characters.
-        </div>""", unsafe_allow_html=True)
-        st.text_input(
-            "Patient ID / Subject Code *",
-            key="patient_id",
-            placeholder="e.g. PATIENT_001",
+        username = st.session_state.get("username") or ""
+        is_registered = (
+            st.session_state.get("authenticated", False)
+            and not st.session_state.get("demo_mode", False)
+            and not username.startswith("guest_")
+            and username != "viva_evaluator"
         )
+
+        # Show the existing ID for a registered account, or derive a
+        # stable ID if this account does not have a saved profile yet.
+        if is_registered:
+            profile = get_patient_profile(username)
+            if profile:
+                st.session_state.patient_id = profile["patient_id"]
+            elif not st.session_state.get("patient_id"):
+                import hashlib
+                suffix = hashlib.sha256(
+                    username.encode("utf-8")
+                ).hexdigest()[:8].upper()
+                st.session_state.patient_id = f"FG-{suffix}"
+
+        patient_id_display = st.session_state.get("patient_id") or "Assigned when you continue"
+        st.markdown(
+            f'<div class="privacy-banner">🔒 <b>Patient ID:</b> '
+            f'<code>{patient_id_display}</code><br>'
+            'This ID is assigned automatically to help identify your assessment record. You do not need to enter it manually.</div>',
+            unsafe_allow_html=True,
+        )
+        # Widget keys use a "w_" prefix and are mirrored into plain session keys each run.
+        # (Assigning to a key that a live widget owns raises StreamlitAPIException.)
+        if "w_patient_id" not in st.session_state:
+            st.session_state.w_patient_id = st.session_state.get("patient_id", "")
+        st.session_state.patient_id = st.session_state.w_patient_id or ""
         c1, c2 = st.columns(2)
         with c1:
-            st.number_input("Your age *", min_value=0, max_value=120, key="age",
+            st.number_input("Your age *", min_value=0, max_value=120,
+                             value=int(st.session_state.age or 0), key="w_age",
                              help="Leave at 0 until you enter a real value — required to continue.")
+            st.session_state.age = st.session_state.w_age
         with c2:
             city_options = [""] + list(CITIES.keys())
             if st.session_state.city and st.session_state.city not in city_options:
@@ -1387,37 +2152,67 @@ elif step == 1:
             )
             st.session_state.city = (city_val or "").strip()
         st.markdown(
-            '<div class="field-help">Not in the list? Just type your own city/town — any location works. '
-            'None of this is pre-filled — every field starts blank for a genuine, unbiased assessment.</div>',
+            '<div class="field-help">Can\'t find your town? Just type it in.</div>',
             unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    def save1():
-        pid = (st.session_state.patient_id or "").strip()
-        if not valid_patient_id(pid):
-            st.error("Please enter a valid Patient ID (3–40 characters: letters, numbers, _ or - only)."); return
-        age = st.session_state.age
-        if not age or age < 18 or age > 90:
-            st.error("Please enter a valid age between 18 and 90."); return
-        if not st.session_state.city:
-            st.error("Please enter your city or town."); return
-        st.session_state.patient_id = pid
-        go(2)
+        def save1():
+            username = st.session_state.get("username") or ""
+            is_registered = (
+                st.session_state.get("authenticated", False)
+                and not st.session_state.get("demo_mode", False)
+                and not username.startswith("guest_")
+                and username != "viva_evaluator"
+            )
 
-    nav(next_label="Continue →", next_fn=save1)
+            age = st.session_state.age
+            city = (st.session_state.city or "").strip()
+
+            if not age or age < 18 or age > 90:
+                st.error("Please enter a valid age between 18 and 90.")
+                return
+
+            if not city:
+                st.error("Please enter your city or town.")
+                return
+
+            if is_registered:
+                # Restore the existing ID if this account already has a profile.
+                profile = get_patient_profile(username)
+                if profile:
+                    pid = profile["patient_id"]
+                else:
+                    # Stable ID for this registered account.
+                    import hashlib
+                    suffix = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8].upper()
+                    pid = f"FG-{suffix}"
+
+                st.session_state.patient_id = pid
+
+                if not save_patient_profile(username, pid, int(age), city):
+                    st.error("Could not save your patient profile. Please try again.")
+                    return
+            else:
+                # Separate, non-account ID for guest/demo sessions.
+                if not st.session_state.get("patient_id"):
+                    st.session_state.patient_id = f"FG-GUEST-{secrets_token().upper()}"
+
+            st.session_state.age = int(age)
+            st.session_state.city = city
+            go(2)
+
+        nav(back=False, next_label="Continue →", next_fn=save1)
+
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 2 — SECTION 02 · RAPID3 SURVEY (FUNCTION + PAIN VAS + GLOBAL ESTIMATE)
+# STEP 2 — YOUR DAILY ACTIVITIES AND SYMPTOMS
 # ══════════════════════════════════════════════════════════════════════════
 elif step == 2:
     st.markdown("""
     <div class="step-wrap">
-      <div class="step-eyebrow">Section 02 · RAPID3 Survey (Functional Disability, Pain, Global Estimate)</div>
+      <div class="step-eyebrow">Part 2 · Daily activities</div>
       <div class="step-title">What can you <em>do — and how do you feel?</em></div>
-      <div class="step-desc">
-        The complete RAPID3 questionnaire — the same tool rheumatologists worldwide use to
-        measure functional disability, pain, and overall disease impact in RA patients.
-      </div>
+      <div class="step-desc">Tap <b style="color:var(--text)">one answer</b> for each question.</div>
       <div class="step-cite">📖 Pincus et al., J Rheumatol 2008;35:2136 · HAQ-DI: Fries et al., Arthritis Rheum 1980 · Pain VAS: Huskisson, Lancet 1974</div>
     </div>""", unsafe_allow_html=True)
 
@@ -1459,9 +2254,9 @@ elif step == 2:
         st.markdown("""
         <div style="padding:0 24px">
         <div class="qcard" style="margin-top:6px">
-          <div class="qcard-hdr">Pain VAS</div>
+          <div class="qcard-hdr">Pain this past week</div>
           <div style="font-size:0.8rem;color:var(--text2);margin-bottom:11px">
-            <b style="color:var(--text)">Official wording:</b> "How much pain have you had because
+            "How much pain have you had because
             of your condition <b style="color:var(--text)">over the past week?</b>"
           </div>
         </div>
@@ -1474,9 +2269,9 @@ elif step == 2:
         st.markdown("""
         <div style="padding:0 24px">
         <div class="qcard" style="margin-top:18px">
-          <div class="qcard-hdr">Patient Global Estimate</div>
+          <div class="qcard-hdr">Overall, how are you doing?</div>
           <div style="font-size:0.8rem;color:var(--text2);margin-bottom:11px">
-            <b style="color:var(--text)">Official wording:</b> "Considering all the ways your illness
+            "Considering all the ways your illness
             affects you at this time — <b style="color:var(--text)">how are you doing overall?</b>"
           </div>
         </div>
@@ -1491,22 +2286,22 @@ elif step == 2:
     nav(next_fn=lambda: go(3))
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 3 — SECTION 03 · DAS28 CLINICAL MARKERS
+# STEP 3 — OPTIONAL CLINICAL INFORMATION
 # ══════════════════════════════════════════════════════════════════════════
 elif step == 3:
     st.markdown("""
     <div class="step-wrap">
-      <div class="step-eyebrow">Section 03 · DAS28 Clinical Markers</div>
-      <div class="step-title">Joint counts <em>&amp; lab markers</em></div>
+      <div class="step-eyebrow">Part 3 · Optional</div>
+      <div class="step-title">Numbers from <em>your doctor</em></div>
       <div class="step-desc">
-        Swollen and tender joint counts (28-joint assessment) are recorded for your clinical
-        audit trail. If you have a recent ESR or CRP lab result, we can also calculate your
-        full DAS28 disease-activity score — <b style="color:var(--text)">this is entirely optional.</b>
+        <b style="color:var(--text)">You can skip this page.</b> Only open the box below if your
+        doctor has given you joint counts or a blood test result (ESR or CRP).
+        Otherwise just press Continue.
       </div>
       <div class="step-cite">📖 DAS28: Prevoo et al., Arthritis Rheum 1995;38:44</div>
     </div>""", unsafe_allow_html=True)
 
-    with st.container():
+    with st.expander("Add my doctor's numbers (optional)", expanded=False):
         st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
 
         st.markdown("""
@@ -1565,31 +2360,24 @@ elif step == 3:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    scoreboard()
     nav(next_fn=lambda: go(4))
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 4 — SECTION 04 · LIFESTYLE & SENSOR METRICS
+# STEP 4 — SLEEP, ENERGY AND RECENT SYMPTOMS
 # ══════════════════════════════════════════════════════════════════════════
 elif step == 4:
     st.markdown("""
     <div class="step-wrap">
-      <div class="step-eyebrow">Section 04 · Lifestyle &amp; Sensor Metrics</div>
-      <div class="step-title">Sleep, stress <em>&amp; recent history</em></div>
-      <div class="step-desc">
-        MDHAQ wellbeing items, fatigue, activity, flare/RA history, and a simple heart-rate
-        reading used to estimate your HRV stress signal.
-      </div>
+      <div class="step-eyebrow">Part 4 · Last questions</div>
+      <div class="step-title">Sleep, tiredness <em>&amp; recent flares</em></div>
+      <div class="step-desc">Six short questions. The pulse question is <b style="color:var(--text)">optional</b>.</div>
       <div class="step-cite">📖 MDHAQ: Pincus 2009 · Fatigue VAS: Wolfe et al. 1996 · Flare count: RADAI — Stucki et al. 1995</div>
     </div>""", unsafe_allow_html=True)
 
     with st.container():
         st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
 
-        st.markdown("""
-        <div class="qcard">
-          <div class="qcard-hdr">MDHAQ Supplement — same 0–3 scale</div>
-        </div>""", unsafe_allow_html=True)
+        st.markdown('<div class="qcard-hdr" style="margin:6px 0 4px">Sleep and mood &mdash; past 7 days</div>', unsafe_allow_html=True)
 
         st.markdown("""
         <div class="q-item">
@@ -1617,7 +2405,7 @@ elif step == 4:
 
         st.markdown("""
         <div class="qcard" style="margin-top:18px">
-          <div class="qcard-hdr">Fatigue VAS · Wolfe et al. 1996</div>
+          <div class="qcard-hdr">Tiredness this past week</div>
           <div style="font-size:0.8rem;color:var(--text2);margin-bottom:9px">
             How much <b style="color:var(--text)">fatigue or tiredness</b> have you had because of your RA <b style="color:var(--text)">over the past week?</b>
           </div>
@@ -1627,7 +2415,7 @@ elif step == 4:
         st.markdown('<div class="vas-ends"><span>0 — No fatigue</span><span>10 — Worst possible</span></div>',
                     unsafe_allow_html=True)
 
-        st.markdown("""<div class="qcard" style="margin-top:14px"><div class="qcard-hdr">Flare history — RADAI adapted</div>""",
+        st.markdown("""<div class="qcard" style="margin-top:14px"><div class="qcard-hdr">Flares in the last 30 days</div>""",
                     unsafe_allow_html=True)
         st.markdown("""<div style="font-size:0.78rem;color:var(--text2);margin-bottom:9px">
         How many times did your joint pain <b style="color:var(--text)">suddenly get much worse</b>
@@ -1635,14 +2423,14 @@ elif step == 4:
         st.number_input("Flares", 0, 30, key="flares30", label_visibility="collapsed")
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown("""<div class="qcard" style="margin-top:11px"><div class="qcard-hdr">RA duration</div>""",
+        st.markdown("""<div class="qcard" style="margin-top:11px"><div class="qcard-hdr">Time since diagnosis</div>""",
                     unsafe_allow_html=True)
         st.markdown("""<div style="font-size:0.78rem;color:var(--text2);margin-bottom:9px">
         How many years ago were you first diagnosed with RA?</div>""", unsafe_allow_html=True)
         st.number_input("Years", 0, 50, key="duration", label_visibility="collapsed")
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown("""<div class="qcard" style="margin-top:11px"><div class="qcard-hdr">Activity today — MDHAQ exercise item</div>""",
+        st.markdown("""<div class="qcard" style="margin-top:11px"><div class="qcard-hdr">Activity today</div>""",
                     unsafe_allow_html=True)
         st.markdown("""<div style="font-size:0.78rem;color:var(--text2);margin-bottom:9px">
         How many minutes of <b style="color:var(--text)">walking or light movement</b> did you do today?</div>""",
@@ -1650,16 +2438,14 @@ elif step == 4:
         st.number_input("Minutes", 0, 180, key="activity", label_visibility="collapsed")
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown("""<div class="qcard" style="margin-top:11px"><div class="qcard-hdr">Heart rate — HRV estimation (optional)</div>""",
+        st.markdown("""<div class="qcard" style="margin-top:11px"><div class="qcard-hdr">Pulse (optional)</div>""",
                     unsafe_allow_html=True)
         st.markdown("""<div style="font-size:0.78rem;color:var(--text2);margin-bottom:9px">
-        What is your <b style="color:var(--text)">current pulse rate?</b>
-        Check your phone health app, smartwatch, or count for 15 seconds × 4.
-        Leave at 0 if you don't know it right now — we'll use a neutral baseline for the
-        forecast and simply note it as "not measured" in your record.</div>""", unsafe_allow_html=True)
+        What is your <b style="color:var(--text)">pulse right now?</b> Check a phone or watch.
+        Not sure? Leave it at 0.</div>""", unsafe_allow_html=True)
         st.number_input("bpm", 0, 220, key="heart_rate", label_visibility="collapsed")
-        st.markdown("""<div style="font-size:0.68rem;color:var(--text3);margin-top:5px">
-        Normal resting pulse = 60 to 100 beats per minute</div></div>""", unsafe_allow_html=True)
+        st.markdown("""<div style="font-size:0.8rem;color:var(--text3);margin:5px 0 12px">
+        Normal resting pulse: 60 to 100.</div></div>""", unsafe_allow_html=True)
 
         confirm = st.checkbox(
             "I confirm the information I've provided in this assessment is accurate to the "
@@ -1672,13 +2458,11 @@ elif step == 4:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    scoreboard()
-
     def save4():
         run_assessment()
         go(5)
 
-    nav(next_label="Calculate My Forecast →", next_fn=save4, next_disabled=not confirm)
+    nav(next_label="View My Assessment →", next_fn=save4, next_disabled=not confirm)
 
 # ══════════════════════════════════════════════════════════════════════════
 # STEP 5 — SECTION 05 · PREDICTIVE MODEL ASSESSMENT & CLINICAL RISK SUMMARY
@@ -1700,364 +2484,386 @@ elif step == 5:
         das = res.get("das28")
         contributions = res["contributions"]
 
+        if res.get("saved_to_db"):
+            st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
+            st.success(
+                f"✅ Assessment Successfully Saved to Local Database · "
+                f"Patient ID: {st.session_state.patient_id}"
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
         st.markdown(f"""
         <div class="step-wrap">
-          <div class="step-eyebrow">Section 05 · Predictive Model Assessment · {st.session_state.city}</div>
+          <div class="step-eyebrow">Your results · {st.session_state.city}</div>
           <div class="result-hero">
-            <div class="result-name">Patient {st.session_state.patient_id} · Age {st.session_state.age}</div>
-            <div class="result-score" style="color:{pcol}">{peak:.0%}</div>
-            <div class="result-pill {plvl}">{fusion.risk_emoji(peak)} {fusion.risk_label(peak).replace('Risk','').strip()} Risk</div>
-            <div class="result-meta">
-              {datetime.now().strftime('%d %b %Y')} &nbsp;·&nbsp;
-              Peak flare risk over the next 3 days
+            <div class="result-name">Your symptom assessment · {datetime.now().strftime('%d %b %Y')}</div>
+            <div style="font-size:0.82rem;font-weight:700;color:var(--text2);margin:12px 0 2px">YOUR PROTOTYPE SCORE</div>
+            <div class="result-score" style="color:{r3sty['text']};font-size:clamp(2.8rem,7vw,4rem)">{r3:.1f}<span style="font-size:1.25rem;color:var(--text2)"> / 30</span></div>
+            <div class="result-pill">Experimental questionnaire summary · {r3sty['label']}</div>
+            <div class="result-meta">Your selected answers about function, pain and overall health contribute to this prototype questionnaire summary.</div>
+            <div style="margin:18px auto 0;max-width:520px;padding:12px 16px;border:1px solid var(--border);border-radius:12px;background:var(--card);text-align:left">
+              <div style="font-weight:700;color:var(--text);margin-bottom:4px">About the experimental heuristic score ({peak * 100:.0f}/100 points)</div>
+              <div style="font-size:0.88rem;line-height:1.55;color:var(--text2)">This is a separate experimental calculation using selected assessment answers and weather inputs. It is not a recognised clinical score and does not represent a probability or percentage chance of an RA flare.</div>
             </div>
           </div>
         </div>""", unsafe_allow_html=True)
 
-        real_ct = 5 - len(MODELS.load_errors) if MODELS else 0
-        cloud_chip = (
-            '<span class="chip ok">☁️ Synced to cloud audit log</span>' if res.get("synced_to_cloud")
-            else '<span class="chip warn">💾 Saved locally &amp; queued for cloud sync (offline)</span>'
+        # The four trained datasets have different targets and feature schemas.
+        # They are deliberately NOT blended into this console score until a
+        # validated, schema-matched fusion model has been trained and evaluated.
+        db_chip = (
+            '<span class="chip ok">💾 Saved to local database</span>' if res.get("saved_to_db")
+            else '<span class="chip warn">⚠️ Not saved to local database</span>'
         )
         st.markdown(f"""
         <div style="padding:0 24px">
         <div class="chips">
           <span class="chip">📍 <b>{st.session_state.city}</b></span>
           <span class="chip">🌡 <b>{weathers[0].temp:.1f}°C</b> · {weathers[0].humidity:.0f}% humidity</span>
-          <span class="chip">📊 RAPID3 <b style="color:{r3sty['text']}">{r3:.1f}/30</b> · {r3sty['label']}</span>
-          <span class="chip">🤖 <b>{real_ct}/5 ML models live</b>{'' if MODELS_OK else ' · fallback active'}</span>
-          {cloud_chip}
+          <span class="chip">📊 Prototype questionnaire <b style="color:{r3sty['text']}">{r3:.1f}/30</b> · {r3sty['label']}</span>
+          <span class="chip warn">🧪 <b>Research prototype score</b></span>
+          {db_chip}
           <span class="chip">⏱ <b>{res.get('submission_latency_ms', 0)} ms</b> to compute</span>
         </div>
         </div>""", unsafe_allow_html=True)
-
-        # ── 1. Peak 3-Day Flare Risk Gauge ─────────────────────────────────
-        st.markdown('<div style="padding:0 24px"><div class="qcard">', unsafe_allow_html=True)
-        st.markdown('<div class="qcard-hdr">Peak 3-Day Flare Risk Gauge</div>', unsafe_allow_html=True)
-        if _PLOTLY_OK:
-            try:
-                gauge = pgo.Figure(pgo.Indicator(
-                    mode="gauge+number",
-                    value=peak * 100,
-                    number={"suffix": "%", "font": {"size": 40, "color": pcol}},
-                    gauge={
-                        "axis": {"range": [0, 100], "tickcolor": "#94A3B8", "tickwidth": 1},
-                        "bar": {"color": pcol, "thickness": 0.28},
-                        "bgcolor": "rgba(0,0,0,0)",
-                        "borderwidth": 0,
-                        "steps": [
-                            {"range": [0, 30], "color": "rgba(16,185,129,0.15)"},
-                            {"range": [30, 60], "color": "rgba(245,158,11,0.15)"},
-                            {"range": [60, 100], "color": "rgba(239,68,68,0.15)"},
-                        ],
-                        "threshold": {"line": {"color": pcol, "width": 3}, "thickness": 0.9, "value": peak * 100},
-                    },
-                ))
-                gauge.update_layout(
-                    height=220, margin=dict(l=20, r=20, t=10, b=10),
-                    paper_bgcolor="rgba(0,0,0,0)", font={"color": "#0F172A", "family": "Inter"},
-                )
-                st.plotly_chart(gauge, use_container_width=True, config={"displayModeBar": False})
-            except Exception as exc:
-                LOG.error("Gauge render failed: %s", exc)
-                st.info(f"Peak risk: **{peak:.0%}** ({fusion.risk_label(peak)}) — chart temporarily unavailable.")
+        # Patient-centred interpretation: describe reported answers, not an unvalidated forecast.
+        symptom_flags = []
+        pain = float(res.get("pain", 0) or 0)
+        if pain >= 7:
+            symptom_flags.append("You reported a high pain level.")
+        elif pain >= 4:
+            symptom_flags.append("You reported a moderate pain level.")
         else:
-            st.info(f"Peak risk: **{peak:.0%}** ({fusion.risk_label(peak)}).")
-
-        day_labels = ["Today", "Tomorrow", "Day +2", "Day +3"]
-        fc_html = ""
-        for i, (label, risk, w) in enumerate(zip(day_labels, risks, weathers)):
-            lvl = fusion.risk_level(risk)
-            col = level_style(lvl, "text")
-            now = "now" if i == 0 else ""
-            emoji = fusion.risk_emoji(risk); lb = fusion.risk_label(risk).replace("Risk", "").strip()
-            date_str = w.date if w.date else datetime.now().strftime("%d %b")
-            live_tag = '<div class="fc-live">● live</div>' if w.is_live else ""
-            fc_html += f"""
-            <div class="fc-box {now}">
-              <div class="fc-day">{label}</div>
-              <div style="font-size:0.6rem;color:var(--text3);margin-bottom:5px">{date_str}</div>
-              <div class="fc-pct" style="color:{col}">{risk:.0%}</div>
-              <div class="fc-badge {lvl}">{emoji} {lb}</div>
-              <div class="fc-wx">{w.temp:.1f}°C · {w.humidity:.0f}%<br>{w.desc[:22]}</div>
-              {live_tag}
-            </div>"""
-        st.markdown(f'<div class="fc-row">{fc_html}</div>', unsafe_allow_html=True)
-        st.caption("4-day weather trend shown above (today + 3-day forecast) drives the peak risk gauge.")
-        st.markdown('</div></div>', unsafe_allow_html=True)
-
-        # ── 2. RAPID3 Score Breakdown ───────────────────────────────────────
-        fn_sc = res["fn_score"]; pain = res["pain"]; gs = res["gs"]; fat = res["fatigue"]
-        fnp = fn_sc / 10 * 100; pp = pain / 10 * 100; gp = gs / 10 * 100; fp_ = fat / 10 * 100; r3p = r3 / 30 * 100
-
-        cats_html = "".join(f"""<div class="r3-cat" style="background:{bg};
-            border:{'2px' if r3sty['label'] == label else '1px'} solid {border}">
-            <div class="r3-catlbl">{cap_label}</div>
-            <div class="r3-catval" style="color:{text}">{label}</div>
-            </div>""" for (cap_label, label, text, bg, border) in [
-                ("≤3", R3_TIERS[0][1], R3_TIERS[0][2], R3_TIERS[0][3], R3_TIERS[0][4]),
-                ("4–6", R3_TIERS[1][1], R3_TIERS[1][2], R3_TIERS[1][3], R3_TIERS[1][4]),
-                ("7–12", R3_TIERS[2][1], R3_TIERS[2][2], R3_TIERS[2][3], R3_TIERS[2][4]),
-                (">12", R3_TIERS[3][1], R3_TIERS[3][2], R3_TIERS[3][3], R3_TIERS[3][4]),
-            ])
-
-        st.markdown(f"""
-        <div style="padding:0 24px">
-        <div class="r3-card">
-          <div class="qcard-hdr">RAPID3 Score Breakdown · Pincus et al. 2008</div>
-          <div class="r3-row">
-            <div class="r3-top"><span class="r3-lbl">Function Score A–J (HAQ-DI)</span><span class="r3-val">{fn_sc:.1f}/10</span></div>
-            <div class="r3-track"><div class="r3-fill" style="width:{fnp:.0f}%;background:var(--teal2)"></div></div>
-          </div>
-          <div class="r3-row">
-            <div class="r3-top"><span class="r3-lbl">Pain VAS (Huskisson 1974)</span><span class="r3-val">{pain:.1f}/10</span></div>
-            <div class="r3-track"><div class="r3-fill" style="width:{pp:.0f}%;background:var(--amber)"></div></div>
-          </div>
-          <div class="r3-row">
-            <div class="r3-top"><span class="r3-lbl">Patient Global Estimate</span><span class="r3-val">{gs:.1f}/10</span></div>
-            <div class="r3-track"><div class="r3-fill" style="width:{gp:.0f}%;background:var(--violet)"></div></div>
-          </div>
-          <div class="r3-row" style="opacity:0.75">
-            <div class="r3-top"><span class="r3-lbl">Fatigue VAS (Wolfe 1996) — supplementary</span><span class="r3-val">{fat:.1f}/10</span></div>
-            <div class="r3-track"><div class="r3-fill" style="width:{fp_:.0f}%;background:var(--teal)"></div></div>
-          </div>
-          <div class="r3-total">
-            <div class="r3-top">
-              <span style="font-weight:700;color:var(--text);font-size:0.78rem">Total RAPID3</span>
-              <span style="color:{r3sty['text']};font-size:0.9rem;font-weight:700">{r3:.1f}/30 · {r3sty['label']}</span>
-            </div>
-            <div class="r3-track" style="height:8px"><div class="r3-fill" style="width:{r3p:.0f}%;background:{r3sty['border']}"></div></div>
-          </div>
-          <div class="r3-cats">{cats_html}</div>
-        </div>
-        </div>""", unsafe_allow_html=True)
-
-        # ── 2b. DAS28 Clinical Markers ──────────────────────────────────────
-        if das:
-            dsty = das["style"]
-            das28_body = f"""
-            <span class="chip" style="background:{dsty['bg']};color:{dsty['text']};border-color:{dsty['border']}">
-              DAS28 <b>{das['score']:.2f}</b> · {dsty['label']}
-            </span>"""
-        else:
-            das28_body = '<span class="chip">No lab value provided — joint counts recorded for audit only</span>'
-        st.markdown(f"""
-        <div style="padding:0 24px">
-        <div class="qcard">
-          <div class="qcard-hdr">DAS28 Clinical Markers · Prevoo et al. 1995</div>
-          <div class="chips" style="margin:0 0 8px">
-            <span class="chip">Swollen joints <b>{st.session_state.das_sjc}/28</b></span>
-            <span class="chip">Tender joints <b>{st.session_state.das_tjc}/28</b></span>
-            {das28_body}
-          </div>
-          <div class="field-help">
-            DAS28 not used as an ML model input in this version — recorded for clinical
-            completeness and audit only.
-          </div>
-        </div>
-        </div>""", unsafe_allow_html=True)
-
-        # ── 3. Feature Importance / XAI Chart ───────────────────────────────
-        st.markdown('<div style="padding:0 24px"><div class="qcard">', unsafe_allow_html=True)
-        st.markdown('<div class="qcard-hdr">🔍 Explainability — Top Risk Contributors</div>', unsafe_allow_html=True)
+            symptom_flags.append("You reported a lower pain level on the scale today.")
+        if res.get("fatigue", 0) >= 7:
+            symptom_flags.append("You reported a high fatigue level.")
+        if res.get("sleep_diff", 0) >= 2:
+            symptom_flags.append("You reported sleep difficulty.")
+        if not symptom_flags:
+            symptom_flags.append("Your assessment responses have been recorded.")
+        st.markdown("### What your answers tell you")
+        st.write(" ".join(symptom_flags))
+        st.caption("This summary describes the answers you entered today; it does not diagnose a flare or predict what will happen next.")
+        st.info(
+            "**About the experimental percentage:** this is generated by FlareGuard's current rule-based calculation using selected assessment answers and weather inputs. "
+            "It is not a recognised clinical score and does not mean you have that percentage chance of an RA flare."
+        )
+        st.markdown("### What can you do with this result?")
         st.markdown(
-            '<div style="font-size:0.74rem;color:var(--text2);margin-bottom:8px">'
-            'Additive decomposition of the peak-day risk score — each bar shows how much that '
-            'factor contributed to the final prediction.</div>', unsafe_allow_html=True)
-        if _PLOTLY_OK:
-            try:
-                items = sorted(contributions.items(), key=lambda kv: kv[1])
-                labels = [k for k, _ in items]
-                values = [v for _, v in items]
-                bar_colors = ["#EF4444" if v == max(values) else "#0EA5E9" for v in values]
-                xai_fig = pgo.Figure(pgo.Bar(
-                    x=values, y=labels, orientation="h",
-                    marker_color=bar_colors,
-                    text=[f"{v:.2f}" for v in values], textposition="outside",
-                ))
-                xai_fig.update_layout(
-                    height=340, margin=dict(l=10, r=30, t=10, b=10),
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    font={"color": "#0F172A", "family": "Inter", "size": 11},
-                    xaxis={"title": "Contribution to risk score", "gridcolor": "#E2E8F0", "zerolinecolor": "#E2E8F0"},
-                    yaxis={"gridcolor": "#E2E8F0"},
-                )
-                st.plotly_chart(xai_fig, use_container_width=True, config={"displayModeBar": False})
-            except Exception as exc:
-                LOG.error("XAI chart render failed: %s", exc)
+            "- Review the symptom summary and your separate RAPID3 result.\n"
+            "- Compare this assessment with your previous sessions to notice changes, if you have previous records.\n"
+            "- Share the assessment with your healthcare professional if you have concerns.\n"
+            "- Do not change medication based on this prototype. Seek medical advice for new, severe, or worsening symptoms regardless of the score."
+        )
+
+        # ── Results are split into tabs so the page no longer needs a long scroll ──
+        tab_sum, tab_why, tab_model, tab_fb = st.tabs(
+            ["📊 What this means", "🔍 Why this score", "🧪 Research details", "💬 Feedback"]
+        )
+
+        with tab_sum:
+            # ── 1. Experimental calculation details (not a flare probability) ─────────────────────────────────
+            st.markdown('<div style="padding:0 24px"><div class="qcard">', unsafe_allow_html=True)
+            st.markdown('<div class="qcard-hdr">Experimental calculation details (not a flare probability)</div>', unsafe_allow_html=True)
+            if _PLOTLY_OK:
+                try:
+                    gauge = pgo.Figure(pgo.Indicator(
+                        mode="gauge+number",
+                        value=peak * 100,
+                        number={"suffix": " pts", "font": {"size": 34, "color": pcol}},
+                        gauge={
+                            "axis": {"range": [0, 100], "tickcolor": "#94A3B8", "tickwidth": 1},
+                            "bar": {"color": pcol, "thickness": 0.28},
+                            "bgcolor": "rgba(0,0,0,0)",
+                            "borderwidth": 0,
+                            "steps": [
+                                {"range": [0, 30], "color": "rgba(16,185,129,0.15)"},
+                                {"range": [30, 60], "color": "rgba(245,158,11,0.15)"},
+                                {"range": [60, 100], "color": "rgba(239,68,68,0.15)"},
+                            ],
+                            "threshold": {"line": {"color": pcol, "width": 3}, "thickness": 0.9, "value": peak * 100},
+                        },
+                    ))
+                    gauge.update_layout(
+                        height=180, margin=dict(l=20, r=20, t=10, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)", font={"color": "#0F172A", "family": "Inter"},
+                    )
+                    st.plotly_chart(gauge, use_container_width=True, config={"displayModeBar": False})
+                except Exception as exc:
+                    LOG.error("Gauge render failed: %s", exc)
+                    st.info(f"Experimental heuristic score: **{peak * 100:.0f}/100 points** ({fusion.risk_label(peak)}) — chart temporarily unavailable.")
+            else:
+                st.info(f"Experimental heuristic score: **{peak * 100:.0f}/100 points** ({fusion.risk_label(peak)}).")
+
+            st.markdown("### Your assessment today")
+            st.write(
+                f"**Pain:** {res['pain']:.1f}/10  ·  "
+                f"**Physical function:** {res['fn_score']:.1f}/10  ·  "
+                f"**Overall health:** {res['gs']:.1f}/10  ·  "
+                f"**Fatigue:** {res['fatigue']:.1f}/10"
+            )
+            st.caption(
+                "These are the responses you reported for this assessment. The prototype does not currently "
+                "provide a validated prediction for tomorrow or the following three days, so future-day score cards are not shown."
+            )
+            st.markdown('</div></div>', unsafe_allow_html=True)
+
+            # Patient-facing next steps: do not infer treatment from the experimental score.
+            st.markdown("""
+            <div style="padding:0 24px"><div class="adv">
+              <div class="adv-hdr">What should I do next?</div>
+              <ul>
+                <li>Review your reported symptoms and your RAPID3 result with your healthcare professional if you have concerns.</li>
+                <li>Do not start, stop, or change medication because of this experimental score.</li>
+                <li>Contact your healthcare professional about new, severe, or worsening symptoms, regardless of the score.</li>
+              </ul>
+            </div>
+            <div class="disc">Research prototype only. The experimental score is not a validated clinical risk estimate, diagnosis, or treatment recommendation.</div>
+            </div>""", unsafe_allow_html=True)
+
+        with tab_why:
+            # ── 2. RAPID3 Score Breakdown ───────────────────────────────────────
+            fn_sc = res["fn_score"]; pain = res["pain"]; gs = res["gs"]; fat = res["fatigue"]
+            fnp = fn_sc / 10 * 100; pp = pain / 10 * 100; gp = gs / 10 * 100; fp_ = fat / 10 * 100; r3p = r3 / 30 * 100
+
+            cats_html = "".join(f"""<div class="r3-cat" style="background:{bg};
+                border:{'2px' if r3sty['label'] == label else '1px'} solid {border}">
+                <div class="r3-catlbl">{cap_label}</div>
+                <div class="r3-catval" style="color:{text}">{label}</div>
+                </div>""" for (cap_label, label, text, bg, border) in [
+                    ("≤3", R3_TIERS[0][1], R3_TIERS[0][2], R3_TIERS[0][3], R3_TIERS[0][4]),
+                    ("4–6", R3_TIERS[1][1], R3_TIERS[1][2], R3_TIERS[1][3], R3_TIERS[1][4]),
+                    ("7–12", R3_TIERS[2][1], R3_TIERS[2][2], R3_TIERS[2][3], R3_TIERS[2][4]),
+                    (">12", R3_TIERS[3][1], R3_TIERS[3][2], R3_TIERS[3][3], R3_TIERS[3][4]),
+                ])
+
+            st.markdown(f"""
+            <div style="padding:0 24px">
+            <div class="r3-card">
+              <div class="qcard-hdr">Prototype Questionnaire Score Breakdown</div>
+              <div class="r3-row">
+                <div class="r3-top"><span class="r3-lbl">Function component (10 selected activities)</span><span class="r3-val">{fn_sc:.1f}/10</span></div>
+                <div class="r3-track"><div class="r3-fill" style="width:{fnp:.0f}%;background:var(--teal2)"></div></div>
+              </div>
+              <div class="r3-row">
+                <div class="r3-top"><span class="r3-lbl">Pain VAS (Huskisson 1974)</span><span class="r3-val">{pain:.1f}/10</span></div>
+                <div class="r3-track"><div class="r3-fill" style="width:{pp:.0f}%;background:var(--amber)"></div></div>
+              </div>
+              <div class="r3-row">
+                <div class="r3-top"><span class="r3-lbl">Patient Global Estimate</span><span class="r3-val">{gs:.1f}/10</span></div>
+                <div class="r3-track"><div class="r3-fill" style="width:{gp:.0f}%;background:var(--violet)"></div></div>
+              </div>
+              <div class="r3-row" style="opacity:0.75">
+                <div class="r3-top"><span class="r3-lbl">Fatigue VAS (Wolfe 1996) — supplementary</span><span class="r3-val">{fat:.1f}/10</span></div>
+                <div class="r3-track"><div class="r3-fill" style="width:{fp_:.0f}%;background:var(--teal)"></div></div>
+              </div>
+              <div class="r3-total">
+                <div class="r3-top">
+                  <span style="font-weight:700;color:var(--text);font-size:0.78rem">Prototype total score</span>
+                  <span style="color:{r3sty['text']};font-size:0.9rem;font-weight:700">{r3:.1f}/30 · {r3sty['label']}</span>
+                </div>
+                <div class="r3-track" style="height:8px"><div class="r3-fill" style="width:{r3p:.0f}%;background:{r3sty['border']}"></div></div>
+              </div>
+              <div class="r3-cats">{cats_html}</div>
+            </div>
+            </div>""", unsafe_allow_html=True)
+
+            # ── 2b. DAS28 Clinical Markers ──────────────────────────────────────
+            if das:
+                dsty = das["style"]
+                das28_body = f"""
+                <span class="chip" style="background:{dsty['bg']};color:{dsty['text']};border-color:{dsty['border']}">
+                  DAS28 <b>{das['score']:.2f}</b> · {dsty['label']}
+                </span>"""
+            else:
+                das28_body = '<span class="chip">No lab value provided — joint counts recorded for audit only</span>'
+            st.markdown(f"""
+            <div style="padding:0 24px">
+            <div class="qcard">
+              <div class="qcard-hdr">DAS28 Clinical Markers · Prevoo et al. 1995</div>
+              <div class="chips" style="margin:0 0 8px">
+                <span class="chip">Swollen joints <b>{st.session_state.das_sjc}/28</b></span>
+                <span class="chip">Tender joints <b>{st.session_state.das_tjc}/28</b></span>
+                {das28_body}
+              </div>
+              <div class="field-help">
+                DAS28 not used as an ML model input in this version — recorded for clinical
+                completeness and audit only.
+              </div>
+            </div>
+            </div>""", unsafe_allow_html=True)
+
+            # ── 3. Feature Importance / XAI Chart ───────────────────────────────
+            st.markdown('<div style="padding:0 24px"><div class="qcard">', unsafe_allow_html=True)
+            st.markdown('<div class="qcard-hdr">🔍 Explainability — Inputs used by the experimental calculation</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div style="font-size:0.74rem;color:var(--text2);margin-bottom:8px">'
+                'Additive decomposition of the peak-day experimental score — each bar shows how much that '
+                'factor contributed to the final heuristic score.</div>', unsafe_allow_html=True)
+            if _PLOTLY_OK:
+                try:
+                    items = sorted(contributions.items(), key=lambda kv: kv[1])
+                    labels = [k for k, _ in items]
+                    values = [v for _, v in items]
+                    bar_colors = ["#EF4444" if v == max(values) else "#0EA5E9" for v in values]
+                    xai_fig = pgo.Figure(pgo.Bar(
+                        x=values, y=labels, orientation="h",
+                        marker_color=bar_colors,
+                        text=[f"{v:.2f}" for v in values], textposition="outside",
+                    ))
+                    xai_fig.update_layout(
+                        height=340, margin=dict(l=10, r=30, t=10, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font={"color": "#0F172A", "family": "Inter", "size": 11},
+                        xaxis={"title": "Contribution to risk score", "gridcolor": "#E2E8F0", "zerolinecolor": "#E2E8F0"},
+                        yaxis={"gridcolor": "#E2E8F0"},
+                    )
+                    st.plotly_chart(xai_fig, use_container_width=True, config={"displayModeBar": False})
+                except Exception as exc:
+                    LOG.error("XAI chart render failed: %s", exc)
+                    for k, v in sorted(contributions.items(), key=lambda kv: -kv[1]):
+                        st.write(f"**{k}**: {v:.2f}")
+            else:
                 for k, v in sorted(contributions.items(), key=lambda kv: -kv[1]):
                     st.write(f"**{k}**: {v:.2f}")
-        else:
-            for k, v in sorted(contributions.items(), key=lambda kv: -kv[1]):
-                st.write(f"**{k}**: {v:.2f}")
-        st.markdown('</div></div>', unsafe_allow_html=True)
+            st.markdown('</div></div>', unsafe_allow_html=True)
 
-        # ── 4. Model Performance Metrics (expandable) ───────────────────────
-        st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
-        try:
-            metrics, metrics_live = fusion.get_model_metrics()
-        except Exception as exc:
-            metrics, metrics_live = {}, False
-            LOG.error("get_model_metrics failed: %s", exc)
-        with st.expander("📈 Model Performance Metrics (cross-validation)"):
-            if not metrics:
-                st.info("Model performance metrics are temporarily unavailable.")
-            else:
+        with tab_model:
+            st.info(
+                "**Research status:** the console currently uses a rule-based clinical-symptom and "
+                "weather heuristic only. The separately trained RA, sleep, HRV, and Sri Lankan RA models "
+                "predict different targets and expect different feature schemas, so they are intentionally "
+                "not fused into this score. A validated, schema-matched meta-model and independent fusion "
+                "evaluation are still required. Base-model metrics below are not fusion-model metrics."
+            )
+            # ── 4. Model Performance Metrics (expandable) ───────────────────────
+            st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
+            try:
+                metrics, metrics_available = fusion.get_model_metrics()
+            except Exception as exc:
+                metrics, metrics_available = {}, False
+                LOG.error("get_model_metrics failed: %s", exc)
+            with st.expander("📈 Model Performance Metrics (single held-out test split)"):
+                metrics_status, metrics_scope = fusion.model_metrics_labels(metrics_available)
                 st.markdown(
-                    ('<span class="model-status ok">✓ Live metrics from models/metrics.json</span>' if metrics_live
-                     else '<span class="model-status fallback">⚠ Demo / reference figures — no models/metrics.json found</span>'),
+                    f'<span class="model-status fallback">{metrics_status}</span>',
                     unsafe_allow_html=True,
                 )
-                st.caption(
-                    "Accuracy, weighted F1, and ROC-AUC from a held-out cross-validation split, "
-                    "compared across the three candidate base learners for each sub-model."
-                )
-                for sub_model, rows in metrics.items():
-                    st.markdown(f"**{sub_model}**")
-                    table_rows = []
-                    for algo, m in rows.items():
-                        table_rows.append({
-                            "Algorithm": algo,
-                            "Accuracy": f"{m['acc']:.3f}",
-                            "F1-Score": f"{m['f1']:.3f}",
-                            "ROC-AUC": f"{m['auc']:.3f}",
-                        })
-                    st.table(table_rows)
-            if MODELS and MODELS.load_errors:
-                st.markdown("**This session's model load status**")
-                for slot, err in MODELS.load_errors.items():
-                    st.markdown(f"- `{slot}` → calibrated fallback used ({err})")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # ── Advisory ─────────────────────────────────────────────────────────
-        if plvl == "high":
-            title = "🔴  High Flare Risk — Action Recommended"
-            items = [
-                "Contact your rheumatologist or doctor today — do not wait",
-                "Rest as much as possible — avoid heavy lifting",
-                "Take your prescribed medicines on time",
-                "Apply warm or cold packs to painful joints",
-                "Avoid going outside during peak midday heat (11am–3pm)",
-            ]
-            if weathers[0].humidity > 75 or any(w.humidity > 75 for w in weathers[1:]):
-                items.append(f"High humidity in {st.session_state.city} — stay indoors, use a fan or AC")
-        elif plvl == "medium":
-            title = "🟡  Moderate Risk — Take Precautions"
-            items = [
-                "Aim for at least 7–8 hours of sleep tonight",
-                "Avoid stressful or physically demanding activities",
-                "Drink plenty of water — stay well hydrated",
-                "Gentle stretching only — no strenuous exercise",
-                "Call your doctor if pain suddenly worsens",
-            ]
-            if any(w.humidity > 75 for w in weathers[1:]):
-                items.append(f"Elevated humidity expected in {st.session_state.city} — take cool breaks")
-        else:
-            title = "🟢  Low Risk — You Are Doing Well"
-            items = [
-                "Continue your current routine and medication schedule",
-                "Stay hydrated — drink water regularly",
-                "Light walking is good for your joints",
-                "Attend any planned appointments",
-            ]
-
-        adv_html = "".join(f'<li><div class="adv-dot {plvl}"></div>{it}</li>' for it in items)
-        st.markdown(f"""
-        <div style="padding:0 24px">
-        <div class="adv {plvl}">
-          <div class="adv-hdr">{title}</div>
-          <ul>{adv_html}</ul>
-        </div>
-        <div class="disc">
-          ⚕️ &nbsp;<b>Clinical Decision Support Only.</b>
-          Based on RAPID3/MDHAQ (Pincus 2008), HAQ-DI (Fries 1980), VAS Pain (Huskisson 1974),
-          Fatigue VAS (Wolfe 1996), RADAI (Stucki 1995), DAS28 (Prevoo 1995).
-          This tool does <b>not replace</b> evaluation by a qualified rheumatologist.
-        </div>
-        </div>""", unsafe_allow_html=True)
-
-        # ── Assessment History ─────────────────────────────────────────────
-        try:
-            history = fusion.get_history(st.session_state.username)
-        except Exception as exc:
-            history = []
-            LOG.error("get_history failed: %s", exc)
-        if history:
-            st.markdown('<div style="padding:0 24px;margin-top:18px">', unsafe_allow_html=True)
-            with st.expander(f"🕓 Your Previous RAPID3 Scores ({len(history)})"):
-                for created_at, city_h, rapid3_h, peak_h, level_h in history:
-                    try:
-                        ts = datetime.fromisoformat(created_at).strftime("%d %b %Y, %H:%M")
-                    except Exception:
-                        ts = created_at
-                    st.markdown(
-                        f"- **{ts}** · {city_h} · RAPID3 **{rapid3_h:.1f}/30** · "
-                        f"Peak risk **{peak_h:.0%}** ({level_h.title()})"
+                if not metrics:
+                    st.info(
+                        "No valid base-model metrics are available. The file may be missing, unreadable, "
+                        "or have an unsupported structure."
                     )
+                else:
+                    st.caption(
+                        "Accuracy, weighted F1, and ROC-AUC on ONE held-out test split, compared across "
+                        "the three candidate base learners for each sub-model."
+                    )
+                    st.caption(
+                        f"{metrics_scope} RA Clinical and Sri Lankan RA have small cohorts, so estimates may be noisy. "
+                        "The HRV dataset lacks reliable subject/session IDs; feature-space grouping is only a proxy "
+                        "and cannot establish patient-level generalisation. Re-run training before quoting metrics."
+                    )
+                    for sub_model, rows in metrics.items():
+                        st.markdown(f"**{sub_model}**")
+                        table_rows = []
+                        for algo, m in rows.items():
+                            table_rows.append({
+                                "Algorithm": algo,
+                                "Accuracy": f"{m['acc']:.3f}",
+                                "F1-Score": f"{m['f1']:.3f}",
+                                "ROC-AUC": f"{m['auc']:.3f}",
+                            })
+                        st.table(table_rows)
+                if MODELS and MODELS.load_errors:
+                    st.markdown("**This session's model load status**")
+                    for slot, err in MODELS.load_errors.items():
+                        st.markdown(f"- `{slot}` → calibrated fallback used ({err})")
             st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Patient Feedback ─────────────────────────────────────────────────
-        st.markdown("""
-        <div style="padding:0 24px;margin-top:22px">
-        <div class="qcard">
-          <div class="qcard-hdr">📝 Patient Feedback — Help improve this system</div>
-          <div style="font-size:0.78rem;color:var(--text2);margin-bottom:14px">
-            Your feedback helps us improve the system. This takes less than 1 minute.
-          </div>
-        </div>
-        </div>""", unsafe_allow_html=True)
+            # ── Assessment History ─────────────────────────────────────────────
+            try:
+                history = fusion.get_history(st.session_state.username)
+            except Exception as exc:
+                history = []
+                LOG.error("get_history failed: %s", exc)
+            if history:
+                st.markdown('<div style="padding:0 24px;margin-top:18px">', unsafe_allow_html=True)
+                with st.expander(f"🕓 Your Previous RAPID3 Scores ({len(history)})"):
+                    for created_at, city_h, rapid3_h, peak_h, level_h in history:
+                        try:
+                            ts = datetime.fromisoformat(created_at).strftime("%d %b %Y, %H:%M")
+                        except Exception:
+                            ts = created_at
+                        st.markdown(
+                            f"- **{ts}** · {city_h} · RAPID3 **{rapid3_h:.1f}/30** · "
+                            f"Experimental score **{peak_h:.0%}** ({level_h.title()})"
+                        )
+                st.markdown('</div>', unsafe_allow_html=True)
 
-        with st.form("feedback_form"):
-            st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
+        with tab_fb:
+            # ── Patient Feedback ─────────────────────────────────────────────────
+            st.markdown("""
+            <div style="padding:0 24px;margin-top:22px">
+            <div class="qcard">
+              <div class="qcard-hdr">📝 Patient Feedback — Help improve this system</div>
+              <div style="font-size:0.78rem;color:var(--text2);margin-bottom:14px">
+                Your feedback helps us improve the system. This takes less than 1 minute.
+              </div>
+            </div>
+            </div>""", unsafe_allow_html=True)
 
-            ease = st.select_slider(
-                "How easy was the system to use?",
-                options=[1, 2, 3, 4, 5],
-                format_func=lambda x: {1: "Very difficult", 2: "Difficult", 3: "Okay", 4: "Easy", 5: "Very easy"}[x],
-                value=4,
-            )
-            clarity = st.select_slider(
-                "How clear were the questions?",
-                options=[1, 2, 3, 4, 5],
-                format_func=lambda x: {1: "Very confusing", 2: "Confusing", 3: "Okay", 4: "Clear", 5: "Very clear"}[x],
-                value=4,
-            )
-            accuracy = st.selectbox(
-                "Did the risk prediction match how you were feeling?",
-                ["Yes — it matched well", "Somewhat — partially correct", "No — it did not match"],
-            )
-            would_use = st.selectbox(
-                "Would you use this system regularly?",
-                ["Yes, definitely", "Maybe", "No"],
-            )
-            comments = st.text_area(
-                "Any comments or suggestions?",
-                placeholder="Optional — write anything here...",
-                height=80,
-            )
+            with st.form("feedback_form"):
+                st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
 
-            fb_submitted = st.form_submit_button("Submit Feedback")
+                ease = st.select_slider(
+                    "How easy was the system to use?",
+                    options=[1, 2, 3, 4, 5],
+                    format_func=lambda x: {1: "Very difficult", 2: "Difficult", 3: "Okay", 4: "Easy", 5: "Very easy"}[x],
+                    value=4,
+                )
+                clarity = st.select_slider(
+                    "How clear were the questions?",
+                    options=[1, 2, 3, 4, 5],
+                    format_func=lambda x: {1: "Very confusing", 2: "Confusing", 3: "Okay", 4: "Clear", 5: "Very clear"}[x],
+                    value=4,
+                )
+                accuracy = st.selectbox(
+                    "Did the risk prediction match how you were feeling?",
+                    ["Yes — it matched well", "Somewhat — partially correct", "No — it did not match"],
+                )
+                would_use = st.selectbox(
+                    "Would you use this system regularly?",
+                    ["Yes, definitely", "Maybe", "No"],
+                )
+                comments = st.text_area(
+                    "Any comments or suggestions?",
+                    placeholder="Optional — write anything here...",
+                    height=80,
+                )
 
-            if fb_submitted:
-                file_exists = os.path.isfile(fusion.FEEDBACK_PATH)
-                try:
-                    with open(fusion.FEEDBACK_PATH, "a", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f)
-                        if not file_exists:
-                            writer.writerow(["timestamp", "patient_id", "city", "age", "risk",
-                                              "ease", "clarity", "accuracy", "would_use", "comments"])
-                        writer.writerow([
-                            datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            st.session_state.patient_id, st.session_state.city, st.session_state.age,
-                            f"{peak:.0%} {plvl.upper()}",
-                            ease, clarity, accuracy, would_use, comments,
-                        ])
-                    st.success("✅ Thank you! Your feedback has been recorded.")
-                except Exception as exc:
-                    LOG.error("Feedback CSV write failed: %s", exc)
-                    st.error("Could not save feedback right now. Please try again.")
+                fb_submitted = st.form_submit_button("Submit Feedback")
 
-            st.markdown('</div>', unsafe_allow_html=True)
+                if fb_submitted:
+                    file_exists = os.path.isfile(fusion.FEEDBACK_PATH)
+                    try:
+                        with open(fusion.FEEDBACK_PATH, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            if not file_exists:
+                                writer.writerow(["timestamp", "patient_id", "city", "age", "risk",
+                                                  "ease", "clarity", "accuracy", "would_use", "comments"])
+                            writer.writerow([
+                                datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                st.session_state.patient_id, st.session_state.city, st.session_state.age,
+                                f"{peak:.0%} {plvl.upper()}",
+                                ease, clarity, accuracy, would_use, comments,
+                            ])
+                        st.success("✅ Thank you! Your feedback has been recorded.")
+                    except Exception as exc:
+                        LOG.error("Feedback CSV write failed: %s", exc)
+                        st.error("Could not save feedback right now. Please try again.")
+
+                st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('<div style="padding:0 24px">', unsafe_allow_html=True)
         if not st.session_state.confirm_reset:

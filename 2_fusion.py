@@ -7,8 +7,8 @@ headlessly (e.g. from a notebook or a CLI) without pulling in Streamlit.
 
 Responsibilities:
   1. Weather context retrieval with a fallback for legacy interface use.
-  2. Legacy model-loading helpers for the old Streamlit console. The fallback
-     scores in this module are not calibrated predictions.
+  2. Legacy base-model loading helpers for the old Streamlit console. The
+     unavailable fusion model is never loaded or replaced with a fake model.
   3. Legacy score calculators retained for backwards compatibility. The React
      API uses project-specific questionnaire summary functions instead.
   4. Legacy heuristic risk functions retained for the old Streamlit console;
@@ -130,7 +130,7 @@ class WeatherClient:
             return WeatherReading(t, h, p, "estimated (no live weather API key configured)", False)
         try:
             r = requests.get(
-                "http://api.openweathermap.org/data/2.5/weather",
+                "https://api.openweathermap.org/data/2.5/weather",
                 params={"q": city, "appid": self.api_key, "units": "metric"},
                 timeout=self.timeout,
             )
@@ -160,7 +160,7 @@ class WeatherClient:
         if self.api_key and city:
             try:
                 r = requests.get(
-                    "http://api.openweathermap.org/data/2.5/forecast",
+                    "https://api.openweathermap.org/data/2.5/forecast",
                     params={"q": city, "appid": self.api_key, "units": "metric", "cnt": 24},
                     timeout=self.timeout,
                 )
@@ -244,7 +244,8 @@ class ModelBundle:
     sleep: object = None
     hrv: object = None
     sl_ra: object = None
-    meta: object = None
+    meta: object = None  # Reserved compatibility field; supervised fusion is unavailable.
+    fusion_available: bool = False
     load_errors: dict = field(default_factory=dict)   # {slot: "ExcType: message"}
     models_ok: bool = False   # True only if every real model loaded cleanly
     any_real: bool = False    # True if at least one real model loaded
@@ -272,11 +273,12 @@ def _load_one(path: str):
 
 
 def load_models(models_dir: str = MODELS_DIR) -> ModelBundle:
-    """Loads each of the four base models plus the meta (fusion) model
-    independently — one file failing to load never prevents the others from
-    loading. Every failure is caught, recorded in `load_errors` for
-    transparent viva reporting, and backfilled with a CalibratedFallbackModel
-    so downstream code can always call `.predict_proba()` safely."""
+    """Load legacy base models without loading or fabricating a fusion model.
+
+    Base-model failures are isolated and backfilled for legacy compatibility.
+    Their outputs are not combined by ``compute_risk`` because the models use
+    different targets and feature schemas.
+    """
     bundle = ModelBundle()
     slots: dict = {}
 
@@ -288,16 +290,8 @@ def load_models(models_dir: str = MODELS_DIR) -> ModelBundle:
             bundle.load_errors[attr] = f"{type(exc).__name__}: {exc}"
             slots[attr] = CalibratedFallbackModel(attr, n_feat)
 
-    try:
-        slots["meta"] = _load_one(os.path.join(models_dir, "meta_model.pkl"))
-        bundle.any_real = True
-    except Exception as exc:
-        bundle.load_errors["meta"] = f"{type(exc).__name__}: {exc}"
-        # meta model blends [p_ra, p_sleep, p_hrv, p_slra] -> weight RA highest
-        slots["meta"] = CalibratedFallbackModel("meta", 4, weights=[0.35, 0.2, 0.2, 0.25])
-
-    bundle.ra, bundle.sleep, bundle.hrv, bundle.sl_ra, bundle.meta = (
-        slots["ra"], slots["sleep"], slots["hrv"], slots["sl_ra"], slots["meta"]
+    bundle.ra, bundle.sleep, bundle.hrv, bundle.sl_ra = (
+        slots["ra"], slots["sleep"], slots["hrv"], slots["sl_ra"]
     )
     bundle.models_ok = len(bundle.load_errors) == 0
     return bundle
@@ -486,15 +480,16 @@ def compute_risk(x: RiskInputs, models: ModelBundle):
 
 
 def project_forward(pain, fatigue, sleep_diff, anxiety, flares_30d, day_offset):
-    """Deterministic trend model used to extrapolate patient-reported fields
-    for the multi-day-ahead forecast (day_offset = 1, 2, 3, ...)."""
-    decay = max(0, (2 - sleep_diff) * 0.04 * day_offset)
-    easing = anxiety * 0.05 * min(day_offset - 1, 1)
+    """Simple deterministic projection of patient-reported fields (NOT a trained
+    forecasting model). Poor sleep and frequent recent flares push the projected
+    symptoms slightly up; anxiety and sleep are carried forward unchanged, so a
+    higher anxiety answer can never lower the projected risk."""
+    sleep_penalty = max(0, sleep_diff - 1) * 0.04 * day_offset
     flare_pressure = flares_30d * 0.005 * day_offset
-    projected_pain = float(np.clip(pain + flare_pressure - easing * 0.3, 0, 10))
-    projected_fatigue = float(np.clip(fatigue + decay, 0, 10))
-    projected_anxiety = float(np.clip(anxiety - easing, 0, 3))
-    projected_sleep_diff = float(np.clip(sleep_diff + decay * 0.5, 0, 3))
+    projected_pain = float(np.clip(pain + flare_pressure + sleep_penalty * 0.5, 0, 10))
+    projected_fatigue = float(np.clip(fatigue + sleep_penalty, 0, 10))
+    projected_anxiety = float(np.clip(anxiety, 0, 3))
+    projected_sleep_diff = float(np.clip(sleep_diff, 0, 3))
     return projected_pain, projected_fatigue, projected_anxiety, projected_sleep_diff
 
 
@@ -507,7 +502,7 @@ def risk_color(r: float) -> str:
 
 
 def risk_label(r: float) -> str:
-    return {"high": "High Risk", "medium": "Moderate Risk", "low": "Low Risk"}[risk_level(r)]
+    return {"high": "Higher heuristic score", "medium": "Intermediate heuristic score", "low": "Lower heuristic score"}[risk_level(r)]
 
 
 def risk_emoji(r: float) -> str:
@@ -518,19 +513,90 @@ def risk_emoji(r: float) -> str:
 # 5. MODEL PERFORMANCE METRICS (viva "Model Performance" tab)
 # ═════════════════════════════════════════════════════════════════════════
 
+def _valid_metrics_payload(data: object) -> bool:
+    """Check the per-dataset, per-model metric structure written by training."""
+    if not isinstance(data, dict) or not data:
+        return False
+
+    required = {
+        "acc", "f1", "auc", "pr_auc", "precision", "recall",
+        "test_rows", "target", "split",
+    }
+    bounded_metrics = ("acc", "f1", "precision", "recall")
+    optional_bounded_metrics = ("auc", "pr_auc")
+
+    for dataset, models in data.items():
+        if not isinstance(dataset, str) or not dataset.strip():
+            return False
+        if not isinstance(models, dict) or not models:
+            return False
+        for model_name, metrics in models.items():
+            if not isinstance(model_name, str) or not model_name.strip():
+                return False
+            if not isinstance(metrics, dict) or not required.issubset(metrics):
+                return False
+            for key in bounded_metrics:
+                value = metrics[key]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not 0 <= value <= 1
+                ):
+                    return False
+            for key in optional_bounded_metrics:
+                value = metrics[key]
+                if value is not None and (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not 0 <= value <= 1
+                ):
+                    return False
+            if (
+                isinstance(metrics["test_rows"], bool)
+                or not isinstance(metrics["test_rows"], int)
+                or metrics["test_rows"] <= 0
+                or not isinstance(metrics["target"], str)
+                or not metrics["target"].strip()
+                or not isinstance(metrics["split"], str)
+                or not metrics["split"].strip()
+            ):
+                return False
+    return True
+
+
 def get_model_metrics(path: str = METRICS_PATH):
-    """Returns (metrics_dict, is_live). `is_live=True` only when a real
-    models/metrics.json produced by the training pipeline was found and
-    parsed successfully; otherwise ({}, False) is returned. There are no
-    hard-coded fallback figures: if the file is missing the UI says so."""
+    """Return structurally valid base-model metrics, or ({}, False).
+
+    The availability flag validates the file's structure; it does not verify
+    when the metrics were generated or independently reproduce their results.
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict) and data:
-            return data, True
-    except Exception:
-        pass
+    except FileNotFoundError:
+        return {}, False
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        LOG.warning("Could not read model metrics from %s: %s", path, exc)
+        return {}, False
+
+    if _valid_metrics_payload(data):
+        return data, True
+    LOG.warning("Model metrics at %s have an invalid structure", path)
     return {}, False
+
+
+def model_metrics_labels(metrics_available: bool) -> tuple[str, str]:
+    """Return explicit scope labels for the separate base-model metric display."""
+    status = (
+        "Base-model test metrics only — not fusion validation; generation time unverified"
+        if metrics_available
+        else "Metrics unavailable — models/metrics.json is missing, unreadable, or invalid"
+    )
+    scope = (
+        "These are base-model metrics for their own dataset-specific targets, "
+        "not flare-risk or fusion metrics."
+    )
+    return status, scope
 
 
 def save_metrics(summary: dict, path: str = METRICS_PATH) -> bool:

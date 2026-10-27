@@ -1,123 +1,411 @@
 """
 prepare_flaredown_v2.py
-========================
-Fixes the target-leakage problem in the original prepare_flaredown.py.
+=======================
+This retained v2 filename implements the v3 candidate-preparation methodology.
+It rebuilds the RA flare dataset with two genuine fixes over the original v2 method:
 
-OLD APPROACH (leakage):
-    flare_risk = (mean of symptom columns TODAY > population median of that same mean)
-    -> target is computed directly from the same columns used as features.
+FIX 1 - COHORT.  v2 selected "RA patients" with
+            str.contains('rheumatoid|arthritis|RA', case=False)
+        The pattern 'RA' with case=False matches ANY condition containing the letters
+        "ra" (Mi-gra-ine, anxiety -> "generalized anxiety", Ulce-ra-tive colitis,
+        Postural ..., Osteoarthritis, Psoriatic arthritis ...). Result: 14,319 "RA" users,
+        of whom only ~1,264 report rheumatoid arthritis.
+        v3 keeps only users whose condition list contains 'rheumatoid' (or exactly 'RA').
 
-NEW APPROACH (genuine forecast):
-    For each RA patient with a long enough check-in history, build one row
-    per "checkpoint day" using ONLY features from the past (days t-6 .. t),
-    and label it using severity from the FUTURE (days t+1 .. t+3) — a real
-    3-day-ahead flare forecast, matching what the README claims the system does.
+FIX 2 - LOOK-AHEAD BASELINE.  v2 computed personal_baseline as the median severity over the
+        patient's WHOLE history (including days after the checkpoint), and used it both as a
+        feature and to define the label. v3 uses an EXPANDING median: only days <= t.
 
-    "Flare" is defined RELATIVE TO THE PATIENT'S OWN BASELINE (their personal
-    median severity over their full history), not a population-wide threshold.
-    This is closer to how flares are clinically understood — a deviation from
-    an individual's normal state — and it means the label isn't just re-deriving
-    population statistics from the same numbers used as features.
+Memory-safe: reads data/ra.csv in chunks (the file is ~700 MB).
+Output: data/ra_processed_v3_candidate.csv
 
-No feature computed from the future window is ever placed in X.
+Checkpoint schema:
+    user_id, checkpoint_date, past_mean_severity, past_std_severity,
+    past_trend, past_last_severity, past_engagement, personal_baseline,
+    flare_next_3d, age, sex
+
+At checkpoint date t, past features use calendar days t-6 through t. The
+flare_next_3d proxy is 1 when mean severity over observed days t+1 through
+t+3 is strictly greater than 1.15 times the expanding median through t.
+At least one future day must be observed; all three are not required.
+Missing daily severity remains missing; the past window requires at least
+three observed days. Missing age remains missing for train-fold imputation.
+Sex retains its source category, with missing/blank values left missing.
 """
+import csv
+import hashlib
+import os
+import sqlite3
+import sys
+import tempfile
+import warnings
+from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-MIN_DAYS = 30          # minimum distinct check-in days to include a patient
-PAST_WINDOW = 7         # days of history used to build features (t-6..t)
-FUTURE_WINDOW = 3        # days ahead used to build the label (t+1..t+3)
-MIN_STEP = 3             # spacing between sampled checkpoint days per user (reduces autocorrelation)
+warnings.filterwarnings("ignore")
 
-print("Loading Flaredown dataset...")
-df = pd.read_csv('data/ra.csv', low_memory=False)
+RAW = "data/ra.csv"
+OUT = "data/ra_processed_v3_candidate.csv"
+MIN_DAYS, PAST, FUT, STEP, MIN_BASE_OBS, FLARE_MULT = 30, 7, 3, 3, 10, 1.15
+CHUNK = 2_000_000
 
-ra_conditions = df[
-    (df['trackable_type'] == 'Condition') &
-    (df['trackable_name'].str.contains('rheumatoid|arthritis|RA', case=False, na=False))
-]
-ra_user_ids = ra_conditions['user_id'].unique()
-print(f"RA patients found: {len(ra_user_ids)}")
+STAGED_COLUMNS = (
+    "user_id",
+    "age",
+    "sex",
+    "checkin_date",
+    "trackable_type",
+    "trackable_value",
+)
+OUTPUT_COLUMNS = (
+    "user_id",
+    "checkpoint_date",
+    "past_mean_severity",
+    "past_std_severity",
+    "past_trend",
+    "past_last_severity",
+    "past_engagement",
+    "personal_baseline",
+    "flare_next_3d",
+    "age",
+    "sex",
+)
 
-symptoms = df[(df['user_id'].isin(ra_user_ids)) & (df['trackable_type'] == 'Symptom')].copy()
-symptoms['trackable_value'] = pd.to_numeric(symptoms['trackable_value'], errors='coerce')
-symptoms['checkin_date'] = pd.to_datetime(symptoms['checkin_date'], errors='coerce')
-symptoms = symptoms.dropna(subset=['checkin_date', 'trackable_value'])
 
-# Daily aggregate severity per user (mean across all logged symptoms that day)
-daily = (symptoms.groupby(['user_id', 'checkin_date'])['trackable_value']
-         .mean()
-         .reset_index()
-         .rename(columns={'trackable_value': 'daily_severity'}))
+def is_ra(names: pd.Series) -> pd.Series:
+    n = names.fillna("").str.strip().str.lower()
+    return n.str.contains("rheumatoid", regex=False) | n.eq("ra")
 
-# Also track how many symptoms were logged that day (engagement signal, legitimate feature)
-daily_count = (symptoms.groupby(['user_id', 'checkin_date'])['trackable_value']
-               .count()
-               .reset_index()
-               .rename(columns={'trackable_value': 'daily_symptom_count'}))
-daily = daily.merge(daily_count, on=['user_id', 'checkin_date'])
 
-eligible_users = daily.groupby('user_id')['checkin_date'].nunique()
-eligible_users = eligible_users[eligible_users >= MIN_DAYS].index
-daily = daily[daily['user_id'].isin(eligible_users)].sort_values(['user_id', 'checkin_date'])
-print(f"Users with >= {MIN_DAYS} distinct check-in days: {len(eligible_users)}")
+def build_patient_checkpoints(uid: str, patient_daily: pd.DataFrame) -> list:
+    """Build past-only features and the unchanged future-worsening target."""
+    g = patient_daily.set_index("dt").sort_index()
+    g = g.reindex(pd.date_range(g.index.min(), g.index.max(), freq="D"))
+    g["cnt"] = g["cnt"].fillna(0)
+    base = g["sev"].expanding(min_periods=1).median()
+    nobs = g["sev"].expanding().count()
 
-profile = df[df['user_id'].isin(eligible_users)][['user_id', 'age', 'sex']].drop_duplicates('user_id').set_index('user_id')
-profile['sex'] = (profile['sex'] == 'female').astype(int)
-profile['age'] = pd.to_numeric(profile['age'], errors='coerce')
-
-rows = []
-for uid, g in daily.groupby('user_id'):
-    g = g.set_index('checkin_date').sort_index()
-    # reindex to a continuous daily calendar so rolling windows are real elapsed time, not just "last N rows"
-    full_range = pd.date_range(g.index.min(), g.index.max(), freq='D')
-    g = g.reindex(full_range)
-    g['daily_severity'] = g['daily_severity']
-    g['daily_symptom_count'] = g['daily_symptom_count'].fillna(0)
-
-    personal_baseline = g['daily_severity'].median(skipna=True)
-    if pd.isna(personal_baseline):
-        continue
-
-    n = len(g)
-    for t in range(PAST_WINDOW - 1, n - FUTURE_WINDOW, MIN_STEP):
-        past = g['daily_severity'].iloc[t - PAST_WINDOW + 1: t + 1]
-        future = g['daily_severity'].iloc[t + 1: t + 1 + FUTURE_WINDOW]
-
-        if past.notna().sum() < 3 or future.notna().sum() < 1:
-            continue  # not enough real data logged in this window, skip rather than fabricate
-
-        past_mean = past.mean(skipna=True)
-        past_std = past.std(skipna=True)
-        past_trend = np.polyfit(range(len(past)), past.fillna(past_mean), 1)[0] if past.notna().sum() >= 2 else 0.0
-        past_last = past.dropna().iloc[-1] if past.notna().any() else past_mean
-        past_engagement = g['daily_symptom_count'].iloc[t - PAST_WINDOW + 1: t + 1].mean()
-
-        future_mean = future.mean(skipna=True)
-        flare = int(future_mean > personal_baseline * 1.15)  # 15% above own baseline = flare
-
+    rows = []
+    for t in range(PAST - 1, len(g) - FUT, STEP):
+        past = g["sev"].iloc[t - PAST + 1: t + 1]
+        fut = g["sev"].iloc[t + 1: t + 1 + FUT]
+        if past.notna().sum() < 3 or fut.notna().sum() < 1 or nobs.iloc[t] < MIN_BASE_OBS:
+            continue
+        pm = past.mean()
         rows.append({
-            'user_id': uid,
-            'past_mean_severity': past_mean,
-            'past_std_severity': past_std,
-            'past_trend': past_trend,
-            'past_last_severity': past_last,
-            'past_engagement': past_engagement,
-            'personal_baseline': personal_baseline,
-            'flare_next_3d': flare,
+            "user_id": uid,
+            "checkpoint_date": g.index[t].strftime("%Y-%m-%d"),
+            "past_mean_severity": pm,
+            "past_std_severity": past.std(),
+            "past_trend": np.polyfit(range(len(past)), past.fillna(pm), 1)[0],
+            "past_last_severity": past.dropna().iloc[-1],
+            "past_engagement": g["cnt"].iloc[t - PAST + 1: t + 1].mean(),
+            "personal_baseline": base.iloc[t],
+            "flare_next_3d": int(fut.mean() > base.iloc[t] * FLARE_MULT),
         })
+    return rows
 
-final = pd.DataFrame(rows)
-final = final.join(profile, on='user_id')
-final = final.dropna(subset=['flare_next_3d'])
-final[['age']] = final[['age']].fillna(final['age'].median())
-final['sex'] = final['sex'].fillna(0)
 
-print(f"\nSamples built: {len(final)}  from {final['user_id'].nunique()} users")
-print(f"Flare=1: {final['flare_next_3d'].sum()}  |  Flare=0: {(final['flare_next_3d']==0).sum()}")
-print(f"Columns: {final.columns.tolist()}")
+def _store_ids(connection, table: str, values) -> None:
+    connection.executemany(
+        f"INSERT OR IGNORE INTO {table} (user_id) VALUES (?)",
+        ((str(value),) for value in values if pd.notna(value)),
+    )
 
-final.to_csv('data/ra_processed_v2.csv', index=False)
-print("\nSaved -> data/ra_processed_v2.csv")
-print("user_id retained so training can do a GROUP split (no user's days in both train and test).")
+
+def _validate_user_ids(chunk: pd.DataFrame) -> None:
+    if any(
+        pd.notna(value) and not isinstance(value, str)
+        for value in chunk["user_id"]
+    ):
+        raise TypeError(
+            "user_id values must be strings; read IDs as strings to preserve leading zeros."
+        )
+
+
+def _matching_ids(connection, table: str, values) -> set:
+    user_ids = pd.Series(values, dtype="string").dropna().drop_duplicates().tolist()
+    matches = set()
+    for start in range(0, len(user_ids), 500):
+        batch = user_ids[start:start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        matches.update(
+            row[0]
+            for row in connection.execute(
+                f"SELECT user_id FROM {table} WHERE user_id IN ({placeholders})",
+                batch,
+            )
+        )
+    return matches
+
+
+def _sqlite_value(value):
+    return None if pd.isna(value) else str(value)
+
+
+def _csv_value(value):
+    return "" if pd.isna(value) else value
+
+
+def _stage_raw_rows(connection, chunks_factory) -> tuple[int, int]:
+    """Stage rows from a repeatable factory yielding fresh iterators over identical data.
+
+    Non-null patient IDs must be strings so their source representation is preserved.
+    """
+    connection.executescript(
+        """
+        CREATE TABLE old_users (user_id TEXT PRIMARY KEY);
+        CREATE TABLE ra_users (user_id TEXT PRIMARY KEY);
+        CREATE TABLE source_rows (
+            source_order INTEGER PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            age TEXT,
+            sex TEXT,
+            checkin_date TEXT,
+            trackable_type TEXT,
+            trackable_value TEXT
+        );
+        CREATE INDEX source_rows_user_order
+            ON source_rows(user_id, source_order);
+        """
+    )
+
+    print("Pass 1/3: finding true RA users (condition rows only)...")
+    first_iterator = iter(chunks_factory())
+    source_row_count = 0
+    source_digest = hashlib.sha256()
+    for chunk in first_iterator:
+        _validate_user_ids(chunk)
+        source_row_count += len(chunk)
+        source_digest.update(
+            pd.util.hash_pandas_object(chunk, index=False).to_numpy().tobytes()
+        )
+        conditions = chunk[chunk["trackable_type"] == "Condition"]
+        old_mask = conditions["trackable_name"].str.contains(
+            "rheumatoid|arthritis|RA", case=False, na=False
+        )
+        old_users = conditions.loc[old_mask, "user_id"].dropna().drop_duplicates()
+        ra_users = conditions.loc[is_ra(conditions["trackable_name"]), "user_id"]
+        _store_ids(connection, "old_users", old_users)
+        _store_ids(connection, "ra_users", ra_users)
+        connection.commit()
+
+    old_count = connection.execute("SELECT COUNT(*) FROM old_users").fetchone()[0]
+    ra_count = connection.execute("SELECT COUNT(*) FROM ra_users").fetchone()[0]
+    print(f"  v2 filter would have selected : {old_count:>6} users")
+    print(f"  v3 strict RA filter selects   : {ra_count:>6} users")
+
+    print("Pass 2/3: extracting their rows...")
+    second_iterator = iter(chunks_factory())
+    if second_iterator is first_iterator:
+        raise ValueError(
+            "chunks_factory must return a fresh iterator over the same source rows on each call."
+        )
+    source_offset = 0
+    second_digest = hashlib.sha256()
+    for chunk in second_iterator:
+        _validate_user_ids(chunk)
+        matching = _matching_ids(connection, "ra_users", chunk["user_id"])
+        second_digest.update(
+            pd.util.hash_pandas_object(chunk, index=False).to_numpy().tobytes()
+        )
+        if matching:
+            selected = chunk.loc[
+                chunk["user_id"].isin(matching), list(STAGED_COLUMNS)
+            ]
+            staged = (
+                (source_offset + position, *(_sqlite_value(value) for value in row))
+                for position, row in enumerate(
+                    selected.itertuples(index=False, name=None)
+                )
+            )
+            connection.executemany(
+                """
+                INSERT INTO source_rows
+                    (source_order, user_id, age, sex, checkin_date,
+                     trackable_type, trackable_value)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                staged,
+            )
+        source_offset += len(chunk)
+        connection.commit()
+    if source_offset != source_row_count:
+        raise ValueError(
+            "chunks_factory yielded a different number of source rows on its second call."
+        )
+    if second_digest.digest() != source_digest.digest():
+        raise ValueError(
+            "chunks_factory yielded different source rows on its second call."
+        )
+    return old_count, ra_count
+
+
+def _patient_checkpoints(connection, uid: str) -> list:
+    records = connection.execute(
+        """
+        SELECT user_id, age, sex, checkin_date, trackable_type, trackable_value
+        FROM source_rows
+        WHERE user_id = ?
+        ORDER BY source_order
+        """,
+        (uid,),
+    ).fetchall()
+    patient = pd.DataFrame.from_records(records, columns=STAGED_COLUMNS)
+
+    sym = patient[patient["trackable_type"] == "Symptom"].copy()
+    sym["v"] = pd.to_numeric(sym["trackable_value"], errors="coerce")
+    sym["dt"] = pd.to_datetime(sym["checkin_date"], errors="coerce")
+    sym = sym.dropna(subset=["v", "dt"])
+    if sym.empty:
+        return []
+
+    daily = (
+        sym.groupby(["user_id", "dt"])
+        .agg(sev=("v", "mean"), cnt=("v", "count"))
+        .reset_index()
+    )
+    if daily["dt"].nunique() < MIN_DAYS:
+        return []
+
+    profile = patient[["age", "sex"]].iloc[0]
+    age = pd.to_numeric(pd.Series([profile["age"]]), errors="coerce").iloc[0]
+    sex = pd.Series([profile["sex"]], dtype="string").str.strip().replace("", pd.NA).iloc[0]
+
+    checkpoints = build_patient_checkpoints(uid, daily.drop(columns="user_id"))
+    for row in checkpoints:
+        row["age"] = age
+        row["sex"] = sex
+    return checkpoints
+
+
+def process_flaredown_chunks(
+    chunks_factory,
+    output_path=OUT,
+    staging_directory=None,
+) -> dict:
+    """Stage and process chunks from a repeatable factory returning fresh iterators.
+
+    Each call to chunks_factory must yield the same source rows in the same order.
+    Non-null user_id values must be strings; use dtype=str when reading CSV data.
+    """
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.resolve() == Path(RAW).resolve():
+        raise ValueError("Candidate output must not overwrite the raw input.")
+    if output.exists():
+        raise FileExistsError(f"Refusing to overwrite existing candidate: {output}")
+
+    temporary_output = None
+    staging_path = None
+    connection = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="flaredown_stage_",
+            suffix=".sqlite",
+            dir=staging_directory,
+            delete=False,
+        ) as staging_file:
+            staging_path = Path(staging_file.name)
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{output.name}.",
+            suffix=".partial",
+            dir=output.parent,
+            delete=False,
+            mode="w",
+            encoding="utf-8",
+            newline="",
+        ) as output_file:
+            temporary_output = Path(output_file.name)
+
+        connection = sqlite3.connect(staging_path)
+        _stage_raw_rows(connection, chunks_factory)
+        print("Pass 3/3: building checkpoints...")
+        row_count = 0
+        patient_count = 0
+        positive_count = 0
+        with temporary_output.open("w", encoding="utf-8", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(OUTPUT_COLUMNS)
+            user_cursor = connection.execute(
+                "SELECT user_id FROM ra_users ORDER BY user_id COLLATE BINARY"
+            )
+            for (uid,) in user_cursor:
+                checkpoints = _patient_checkpoints(connection, uid)
+                if not checkpoints:
+                    continue
+                patient_count += 1
+                for checkpoint in checkpoints:
+                    writer.writerow(
+                        [_csv_value(checkpoint[column]) for column in OUTPUT_COLUMNS]
+                    )
+                    row_count += 1
+                    positive_count += checkpoint["flare_next_3d"]
+        connection.close()
+        connection = None
+
+        if output.exists():
+            raise FileExistsError(f"Refusing to overwrite existing candidate: {output}")
+        os.link(temporary_output, output)
+        temporary_output.unlink()
+        temporary_output = None
+        return {
+            "rows": row_count,
+            "patients": patient_count,
+            "positive_count": positive_count,
+            "output": str(output),
+        }
+    finally:
+        active_exception = sys.exc_info()[0] is not None
+        cleanup_errors = []
+        staging_cleanup_safe = True
+        if connection is not None:
+            try:
+                connection.close()
+            except BaseException as error:
+                cleanup_errors.append(("SQLite connection", error))
+                staging_cleanup_safe = False
+                print(
+                    f"Cleanup failed to close SQLite connection; "
+                    f"staging file may remain at {staging_path}: {error}",
+                    file=sys.stderr,
+                )
+        if temporary_output is not None:
+            try:
+                temporary_output.unlink(missing_ok=True)
+            except BaseException as error:
+                cleanup_errors.append((str(temporary_output), error))
+        if staging_path is not None and staging_cleanup_safe:
+            try:
+                staging_path.unlink(missing_ok=True)
+            except BaseException as error:
+                cleanup_errors.append((str(staging_path), error))
+        if cleanup_errors:
+            if active_exception:
+                for resource, error in cleanup_errors:
+                    if resource == "SQLite connection":
+                        continue
+                    print(
+                        f"Cleanup failed for {resource}: {error}",
+                        file=sys.stderr,
+                    )
+            else:
+                raise cleanup_errors[0][1]
+
+
+def main():
+    def chunks_factory():
+        return pd.read_csv(RAW, chunksize=CHUNK, dtype=str)
+
+    result = process_flaredown_chunks(chunks_factory)
+    positive_rate = result["positive_count"] / result["rows"] if result["rows"] else float("nan")
+    print(
+        f"\nSaved {result['output']}: {result['rows']} rows, "
+        f"{result['patients']} patients, flare rate {positive_rate:.3f}"
+    )
+
+
+if __name__ == "__main__":
+    main()

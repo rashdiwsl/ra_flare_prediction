@@ -66,6 +66,15 @@ export interface AssessmentResult {
     peak_experimental_score: number
     peak_risk_level: string
     contributions: Record<string, number>
+    reported_inputs?: {
+      symptom_change: 'better' | 'same' | 'worse'
+      fatigue: number
+      sleep_difficulty: number
+      anxiety: number
+      flares_30d: number
+      activity_min: number
+      heart_rate_bpm: number | null
+    }
   }
   weather: {
     city: string

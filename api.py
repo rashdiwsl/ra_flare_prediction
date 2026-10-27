@@ -2,7 +2,8 @@
 """
 api.py — RA FlareGuard FastAPI backend
 Provides authentication, assessments, experimental risk scoring,
-forecast projections, and per-user assessment history.
+and per-user assessment history. No validated future flare forecast is
+currently available.
 """
 
 import hashlib
@@ -10,7 +11,6 @@ import importlib.util
 import os
 import secrets
 import sys
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -45,8 +45,17 @@ FRONTEND_ORIGINS = [
     if origin.strip()
 ]
 
-# Set COOKIE_SECURE=true when the application is deployed over HTTPS.
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+# Secure cookies are the safe default. Local HTTP development may explicitly
+# disable this only when APP_ENV is set to development.
+APP_ENV = os.getenv("APP_ENV", "production").strip().lower()
+COOKIE_SECURE_VALUE = os.getenv("COOKIE_SECURE", "true").strip().lower()
+if COOKIE_SECURE_VALUE not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+    raise RuntimeError("COOKIE_SECURE must be set to a boolean value.")
+COOKIE_SECURE = COOKIE_SECURE_VALUE in {"1", "true", "yes", "on"}
+if APP_ENV in {"prod", "production"} and not COOKIE_SECURE:
+    raise RuntimeError("COOKIE_SECURE cannot be disabled when APP_ENV is production.")
+if not COOKIE_SECURE and APP_ENV != "development":
+    raise RuntimeError("COOKIE_SECURE may be disabled only when APP_ENV is development.")
 
 
 # ============================================================
@@ -103,12 +112,6 @@ models = fusion.load_models()
 # ============================================================
 # DATABASE AND SESSION HELPERS
 # ============================================================
-
-def _day_weather(weather_days, day, today_weather):
-    # Use that day's forecast when available, otherwise today's weather.
-    w = weather_days[day - 1] if len(weather_days) >= day else today_weather
-    return {"temp": w.temp, "humidity": w.humidity, "pressure": w.pressure}
-
 
 def connect_db():
     return connect_database(str(DB_PATH))
@@ -302,6 +305,18 @@ class AssessmentRequest(BaseModel):
     heart_rate: int = Field(default=0, ge=0, le=250)
 
 
+def _reported_input_summary(assessment: AssessmentRequest) -> dict:
+    return {
+        "symptom_change": assessment.symptom_change,
+        "fatigue": assessment.fatigue,
+        "sleep_difficulty": assessment.sleep_diff,
+        "anxiety": assessment.anxiety,
+        "flares_30d": assessment.flares_30d,
+        "activity_min": assessment.activity_min,
+        "heart_rate_bpm": assessment.heart_rate or None,
+    }
+
+
 # ============================================================
 # GENERAL ENDPOINTS
 # ============================================================
@@ -334,6 +349,8 @@ def system_info():
         "database_name": "postgresql" if is_postgres() else DB_PATH.name,
         "risk_method": "experimental heuristic",
         "clinically_validated": False,
+        "fusion_model_available": models.fusion_available,
+        "fusion_model_status": "unavailable: no independent patient-aligned fusion labels",
         "trained_fusion_predictions_used_by_risk_score": False,
         "models_loaded_without_errors": models.models_ok,
         "real_model_available": models.any_real,
@@ -543,67 +560,7 @@ def create_assessment(
             models,
         )
 
-        # This is a deterministic symptom projection, not a trained
-        # future-risk model. Compute projected scores for days 1-3.
-        weather_days = fusion.WeatherClient().forecast(city, days=3)
-        forecast = []
-
-        for day in range(1, 4):
-            (
-                projected_pain,
-                projected_fatigue,
-                projected_anxiety,
-                projected_sleep_diff,
-            ) = fusion.project_forward(
-                pain=assessment.pain,
-                fatigue=assessment.fatigue,
-                sleep_diff=assessment.sleep_diff,
-                anxiety=assessment.anxiety,
-                flares_30d=assessment.flares_30d,
-                day_offset=day,
-            )
-
-            projected_inputs = replace(
-                risk_inputs,
-                pain=projected_pain,
-                fatigue=projected_fatigue,
-                anxiety=int(round(projected_anxiety)),
-                sleep_diff=int(round(projected_sleep_diff)),
-                **_day_weather(weather_days, day, weather),
-            )
-
-            projected_rapid3 = fusion.rapid3_total(
-                assessment.fn_vals,
-                projected_pain,
-                assessment.global_estimate,
-            )
-            projected_inputs = replace(
-                projected_inputs,
-                rapid3=projected_rapid3,
-            )
-
-            projected_score, _ = fusion.compute_risk(
-                projected_inputs,
-                models,
-            )
-
-            forecast.append({
-                "day": day,
-                "pain": round(projected_pain, 2),
-                "fatigue": round(projected_fatigue, 2),
-                "anxiety": round(projected_anxiety, 2),
-                "sleep_difficulty": round(projected_sleep_diff, 2),
-                "experimental_score": round(projected_score, 4),
-                "risk_level": fusion.risk_level(projected_score),
-                "temperature": round(float(projected_inputs.temp), 1),
-                "humidity": round(float(projected_inputs.humidity)),
-            })
-
-        peak_risk = max(
-            [risk_score] + [
-                item["experimental_score"] for item in forecast
-            ]
-        )
+        peak_risk = risk_score
         level = fusion.risk_level(peak_risk)
 
         saved = fusion.save_assessment(
@@ -637,6 +594,7 @@ def create_assessment(
                 "function_score": round(fn_score, 2),
                 "pain": assessment.pain,
                 "global_estimate": assessment.global_estimate,
+                "reported_inputs": _reported_input_summary(assessment),
                 "experimental_score": round(risk_score, 4),
                 "risk_level": fusion.risk_level(risk_score),
                 "risk_label": fusion.risk_label(risk_score),
@@ -656,11 +614,11 @@ def create_assessment(
                 "description": weather.desc,
                 "is_live": weather.is_live,
             },
-            "forecast": forecast,
+            "forecast": [],
             "limitations": [
                 "The score is an experimental heuristic, not a calibrated flare probability.",
                 "The risk calculation does not combine trained model predictions.",
-                "Future scores use a deterministic projection, not a trained forecasting model.",
+                "No clinically validated three-day RA flare forecast is available.",
                 "Weather may use an estimated fallback instead of live measurements.",
                 "This research prototype is not a diagnosis or a substitute for clinical care.",
             ],
@@ -749,55 +707,7 @@ def create_guest_assessment(assessment: AssessmentRequest):
 
         risk_score, contributions = fusion.compute_risk(risk_inputs, models)
 
-        # These are deterministic projections, not trained forecasts.
-        weather_days = fusion.WeatherClient().forecast(city, days=3)
-        forecast = []
-        for day in range(1, 4):
-            (
-                projected_pain,
-                projected_fatigue,
-                projected_anxiety,
-                projected_sleep_diff,
-            ) = fusion.project_forward(
-                pain=assessment.pain,
-                fatigue=assessment.fatigue,
-                sleep_diff=assessment.sleep_diff,
-                anxiety=assessment.anxiety,
-                flares_30d=assessment.flares_30d,
-                day_offset=day,
-            )
-
-            projected_inputs = replace(
-                risk_inputs,
-                pain=projected_pain,
-                fatigue=projected_fatigue,
-                anxiety=int(round(projected_anxiety)),
-                sleep_diff=int(round(projected_sleep_diff)),
-                **_day_weather(weather_days, day, weather),
-            )
-            projected_rapid3 = fusion.rapid3_total(
-                assessment.fn_vals,
-                projected_pain,
-                assessment.global_estimate,
-            )
-            projected_inputs = replace(projected_inputs, rapid3=projected_rapid3)
-            projected_score, _ = fusion.compute_risk(projected_inputs, models)
-
-            forecast.append({
-                "day": day,
-                "pain": round(projected_pain, 2),
-                "fatigue": round(projected_fatigue, 2),
-                "anxiety": round(projected_anxiety, 2),
-                "sleep_difficulty": round(projected_sleep_diff, 2),
-                "experimental_score": round(projected_score, 4),
-                "risk_level": fusion.risk_level(projected_score),
-                "temperature": round(float(projected_inputs.temp), 1),
-                "humidity": round(float(projected_inputs.humidity)),
-            })
-
-        peak_risk = max(
-            [risk_score] + [item["experimental_score"] for item in forecast]
-        )
+        peak_risk = risk_score
         level = fusion.risk_level(peak_risk)
         category, _category_color = fusion.rapid3_category(rapid3)
 
@@ -815,6 +725,7 @@ def create_guest_assessment(assessment: AssessmentRequest):
                 "function_score": round(fn_score, 2),
                 "pain": assessment.pain,
                 "global_estimate": assessment.global_estimate,
+                "reported_inputs": _reported_input_summary(assessment),
                 "experimental_score": round(risk_score, 4),
                 "risk_level": fusion.risk_level(risk_score),
                 "risk_label": fusion.risk_label(risk_score),
@@ -834,11 +745,11 @@ def create_guest_assessment(assessment: AssessmentRequest):
                 "description": weather.desc,
                 "is_live": weather.is_live,
             },
-            "forecast": forecast,
+            "forecast": [],
             "limitations": [
                 "The score is an experimental heuristic, not a calibrated flare probability.",
                 "The risk calculation does not combine trained model predictions.",
-                "Future scores use a deterministic projection, not a trained forecasting model.",
+                "No clinically validated three-day RA flare forecast is available.",
                 "Weather may use an estimated fallback instead of live measurements.",
                 "This research prototype is not a diagnosis or a substitute for clinical care.",
                 "Guest assessments are not saved to account history.",

@@ -24,6 +24,24 @@ const navigation: { label: Page; icon: string }[] = [
   { label: 'Forecast History', icon: '▤' },
 ]
 
+const contributionLabels: Record<string, string> = {
+  'Pain VAS': 'Pain response',
+  'RAPID3 Function Component': 'Daily-function responses',
+  'Patient Global Estimate': 'Overall-health response',
+  'Flare History (30d)': 'Reported symptom worsening in the past 30 days',
+  'Sleep Difficulty': 'Sleep response',
+  'Fatigue VAS': 'Fatigue response',
+  'Humidity (heuristic)': 'Humidity input',
+  'Temperature (heuristic)': 'Temperature input',
+}
+
+function scorePoints(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 'Not available'
+  }
+  return `${(value * 100).toFixed(1)} / 100 score points`
+}
+
 
 function AuthScreen({
   onAuthenticated,
@@ -486,7 +504,14 @@ function App() {
     : user?.display_name || user?.username || 'User'
 
   const avatarLetter = displayName.charAt(0).toUpperCase()
-
+  const resultAssessment = latestAssessment?.assessment
+  const resultScore = resultAssessment?.experimental_score
+  const resultContributions = Object.entries(resultAssessment?.contributions ?? {})
+    .filter(([, value]) => Number.isFinite(value))
+    .sort((left, right) => right[1] - left[1])
+  const reportedInputs = resultAssessment?.reported_inputs
+  const sleepLabels = ['Very well', 'Okay', 'Poorly', 'Very poorly']
+  const anxietyLabels = ['Not at all', 'A little', 'Quite a bit', 'Extremely']
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -653,7 +678,7 @@ function App() {
               <div className="overview-metrics">
                 <article className="overview-metric-card">
                   <span className="overview-metric-icon blue" aria-hidden="true">◉</span>
-                  <span className="overview-metric-label">LATEST RAPID3-STYLE SCORE</span>
+                  <span className="overview-metric-label">LATEST PROJECT SUMMARY</span>
                   <strong>
                     {latestAssessment
                       ? latestAssessment.assessment.rapid3.toFixed(1)
@@ -663,7 +688,7 @@ function App() {
                   </strong>
                   <small>
                     {latestAssessment
-                      ? latestAssessment.assessment.rapid3_category
+                      ? 'Project-specific summary; not a disease-activity measure'
                       : historyItems[0]
                         ? 'From your latest saved assessment'
                         : 'Complete a check-in to see this value'}
@@ -673,7 +698,17 @@ function App() {
                 <article className="overview-metric-card">
                   <span className="overview-metric-icon coral" aria-hidden="true">♡</span>
                   <span className="overview-metric-label">PAIN REPORTED</span>
-                  <strong>{latestAssessment ? `${latestAssessment.assessment.pain}<small>/10</small>` : '—'}</strong>
+                  {/* FIX: <small> is now real JSX, not text inside a string */}
+                  <strong>
+                    {latestAssessment ? (
+                      <>
+                        {latestAssessment.assessment.pain}
+                        <small>/10</small>
+                      </>
+                    ) : (
+                      '—'
+                    )}
+                  </strong>
                   <small>{latestAssessment ? 'In your latest check-in' : 'Record a check-in to see this value'}</small>
                 </article>
 
@@ -686,15 +721,13 @@ function App() {
 
                 <article className="overview-metric-card">
                   <span className="overview-metric-icon mint" aria-hidden="true">⌁</span>
-                  <span className="overview-metric-label">EXPERIMENTAL SCORE</span>
+                  <span className="overview-metric-label">EXPERIMENTAL SCORE · POINTS</span>
                   <strong>
                     {latestAssessment
-                      ? `${(latestAssessment.assessment.experimental_score * 100).toFixed(0)}%`
-                      : historyItems[0]?.peak_experimental_score == null
-                        ? '—'
-                        : `${(historyItems[0].peak_experimental_score * 100).toFixed(0)}%`}
+                      ? scorePoints(latestAssessment.assessment.experimental_score)
+                      : '—'}
                   </strong>
-                  <small>Prototype output, not a flare probability</small>
+                  <small>Rule-based score, not a flare probability</small>
                 </article>
               </div>
 
@@ -707,7 +740,7 @@ function App() {
                       <p>
                         {isGuest
                           ? 'Guest assessments are not saved to your check-in history'
-                          : 'RAPID3-style scores from your saved assessments'}
+                          : 'Project-specific patient-reported summaries from saved check-ins'}
                       </p>
                     </div>
                     <button
@@ -720,31 +753,13 @@ function App() {
                   </div>
 
                   {historyItems.filter((item) => item.rapid3 != null).length > 1 ? (
-                    <div
-                      className="overview-chart"
-                      role="img"
-                      aria-label={`RAPID3-style score chart for ${Math.min(historyItems.filter((item) => item.rapid3 != null).length, 7)} recent saved assessments`}
-                    >
-                      <div className="overview-chart-guides" aria-hidden="true">
-                        <span>30</span><span>20</span><span>10</span><span>0</span>
-                      </div>
-                      <div className="overview-chart-bars">
-                        {historyItems
-                          .filter((item) => item.rapid3 != null)
-                          .slice(0, 7)
-                          .reverse()
-                          .map((item, index) => {
-                            const score = item.rapid3 ?? 0
-                            const height = Math.max(5, Math.min(100, (score / 30) * 100))
-                            return (
-                              <div className="overview-chart-column" key={`${item.created_at}-${index}`}>
-                                <strong>{score.toFixed(1)}</strong>
-                                <span className="overview-chart-bar" style={{ height: `${height}%` }} />
-                                <small>{new Date(item.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</small>
-                              </div>
-                            )
-                          })}
-                      </div>
+                    <div className="overview-chart-empty" role="status">
+                      <strong>Historical check-ins are available</strong>
+                      <p>
+                        A question-set version is not stored with older summaries,
+                        so this prototype does not plot a score trend. Changes in
+                        reported symptoms alone do not confirm a clinical flare.
+                      </p>
                     </div>
                   ) : (
                     <div className="overview-chart-empty">
@@ -760,7 +775,7 @@ function App() {
                       </button>
                     </div>
                   )}
-                  <p className="overview-chart-note">Scores summarize submitted answers and are not a diagnosis or a measure of disease activity.</p>
+                  <p className="overview-chart-note">These project-specific summaries are not validated clinical measures or clinician-assessed disease activity.</p>
                 </section>
 
                 <section className="overview-panel overview-checkin-panel">
@@ -800,7 +815,7 @@ function App() {
                     <article className="overview-activity-row">
                       <span className="overview-activity-icon" aria-hidden="true">✓</span>
                       <div><strong>Check-in completed</strong><small>{new Date(latestAssessment.assessment.created_at).toLocaleString()}</small></div>
-                      <span className="overview-activity-value">RAPID3 {latestAssessment.assessment.rapid3.toFixed(1)}</span>
+                      <span className="overview-activity-value">Project summary {latestAssessment.assessment.rapid3.toFixed(1)}/30</span>
                     </article>
                   ) : (
                     <p className="overview-activity-empty">Your check-ins will appear here after you complete an assessment.</p>
@@ -814,7 +829,7 @@ function App() {
                     <article className="overview-activity-row" key={`${item.created_at}-${index}`}>
                       <span className="overview-activity-icon" aria-hidden="true">✓</span>
                       <div><strong>Check-in completed</strong><small>{new Date(item.created_at).toLocaleString()}{item.city ? ` · ${item.city}` : ''}</small></div>
-                      <span className="overview-activity-value">{item.rapid3 == null ? 'Score unavailable' : `RAPID3 ${item.rapid3.toFixed(1)}`}</span>
+                      <span className="overview-activity-value">{item.rapid3 == null ? 'Summary unavailable' : `Project summary ${item.rapid3.toFixed(1)}/30`}</span>
                     </article>
                   ))
                 ) : (
@@ -825,11 +840,11 @@ function App() {
           )}
 
           {activePage === 'Results' && (
-            <section className="panel secondary-page results-page">
+            <section className="panel secondary-page results-page" aria-labelledby="assessment-results-title">
               {!latestAssessment ? (
                 <div className="results-empty">
                   <span className="results-empty-icon" aria-hidden="true">✓</span>
-                  <h2>Your assessment summary</h2>
+                  <h2 id="assessment-results-title">Your assessment summary</h2>
                   <p>Complete an assessment to see a summary based on your answers.</p>
                   <button type="button" className="primary-button" onClick={startAssessment}>
                     Start assessment <span aria-hidden="true">→</span>
@@ -840,7 +855,7 @@ function App() {
                   <div className="results-heading">
                     <div>
                       <p className="eyebrow">YOUR LATEST CHECK-IN</p>
-                      <h2>Assessment results</h2>
+                      <h2 id="assessment-results-title">Assessment summary</h2>
                       <p className="results-date">{new Date(latestAssessment.assessment.created_at).toLocaleString()}</p>
                     </div>
                     <span className="results-session-label">{isGuest ? 'Guest result' : 'Saved assessment'}</span>
@@ -848,97 +863,202 @@ function App() {
 
                   <article className="risk-result-card">
                     <div className="risk-result-topline">
-                      <span className="risk-result-label">EXPERIMENTAL SCORE</span>
-                      <span className="risk-category-pill">{latestAssessment.assessment.risk_label}</span>
+                      <span className="risk-result-label">EXPERIMENTAL RULE-BASED SCORE</span>
                     </div>
-                    <div className="risk-result-value">
-                      {(latestAssessment.assessment.experimental_score * 100).toFixed(1)}<span>%</span>
-                    </div>
-                    <div
-                      className="risk-meter"
-                      role="img"
-                      aria-label={`Visual indicator for experimental score ${(latestAssessment.assessment.experimental_score * 100).toFixed(1)} percent; this is not a validated flare probability`}
-                    >
-                      <span style={{ width: `${Math.max(0, Math.min(100, latestAssessment.assessment.experimental_score * 100))}%` }} />
-                    </div>
+                    <h3 className="risk-result-value">
+                      {scorePoints(resultScore)}
+                    </h3>
                     <p className="risk-result-explainer">
-                      An experimental score calculated by this research prototype. It is <strong>not</strong> a validated probability that an RA flare will occur.
+                      These are score points from the current rule-based calculation, not a percentage chance or prediction of an RA flare. It combines selected symptom answers with temperature and humidity inputs; trained model predictions are not used.
                     </p>
                   </article>
 
                   <div className="result-metrics-grid">
                     <article className="result-metric-card">
                       <span className="result-metric-icon" aria-hidden="true">◉</span>
-                      <span className="result-metric-label">RAPID3-style score</span>
-                      <strong>{latestAssessment.assessment.rapid3.toFixed(1)}</strong>
-                      <span className="result-metric-note">{latestAssessment.assessment.rapid3_category}</span>
+                      <span className="result-metric-label">Project symptom &amp; function summary</span>
+                      <strong>{Number.isFinite(latestAssessment.assessment.rapid3) ? latestAssessment.assessment.rapid3.toFixed(1) : 'Not available'}</strong>
+                      <span className="result-metric-note">0–30 project scale; not a validated RAPID3 score</span>
                     </article>
                     <article className="result-metric-card">
                       <span className="result-metric-icon" aria-hidden="true">↗</span>
-                      <span className="result-metric-label">Function score</span>
-                      <strong>{latestAssessment.assessment.function_score.toFixed(1)}</strong>
-                      <span className="result-metric-note">From your function answers</span>
+                      <span className="result-metric-label">Daily-function responses</span>
+                      <strong>{Number.isFinite(latestAssessment.assessment.function_score) ? latestAssessment.assessment.function_score.toFixed(1) : 'Not available'}</strong>
+                      <span className="result-metric-note">Project scale; not a validated function index</span>
                     </article>
                     <article className="result-metric-card">
                       <span className="result-metric-icon" aria-hidden="true">♡</span>
                       <span className="result-metric-label">Pain reported</span>
-                      <strong>{latestAssessment.assessment.pain}<small>/10</small></strong>
+                      <strong>{Number.isFinite(latestAssessment.assessment.pain) ? `${latestAssessment.assessment.pain}/10` : 'Not available'}</strong>
                       <span className="result-metric-note">Your answer</span>
                     </article>
                   </div>
 
-                  <section className="patient-meaning-section">
+                  <section className="patient-meaning-section" aria-labelledby="assessment-details-title">
                     <div className="patient-section-heading">
                       <span className="patient-section-icon" aria-hidden="true">♡</span>
                       <div>
                         <p className="eyebrow">IN PLAIN LANGUAGE</p>
-                        <h3>What your answers tell you</h3>
+                        <h3 id="assessment-details-title">What your answers tell you</h3>
                       </div>
                     </div>
                     <p>
-                      This is a snapshot of the answers you gave today, not a diagnosis.
-                      {latestAssessment.assessment.pain === 0
-                        ? ' You reported no pain in this check-in.'
-                        : ` You reported pain at ${latestAssessment.assessment.pain}/10 in this check-in.`}
-                      {' '}Your RAPID3-style and function scores summarise responses using this prototype's scoring approach; they do not by themselves establish whether your RA is active or in remission.
+                      This summary reflects only the information returned for this check-in. It does not establish whether your RA is active or in remission.
                     </p>
                     <div className="patient-observation-grid">
                       <div>
-                        <strong>{latestAssessment.assessment.pain}/10</strong>
+                        <strong>{Number.isFinite(latestAssessment.assessment.pain) ? `${latestAssessment.assessment.pain}/10` : 'Not available'}</strong>
                         <span>Pain you reported</span>
                       </div>
                       <div>
-                        <strong>{latestAssessment.assessment.function_score.toFixed(1)}</strong>
-                        <span>Function score from your activity answers</span>
+                        <strong>{Number.isFinite(latestAssessment.assessment.global_estimate) ? `${latestAssessment.assessment.global_estimate}/10` : 'Not available'}</strong>
+                        <span>Overall health rating you reported</span>
                       </div>
                     </div>
                   </section>
 
-                  <section className="patient-next-steps">
+                  <section className="result-details-section" aria-labelledby="result-context-title">
+                    <div className="patient-section-heading">
+                      <span className="patient-section-icon" aria-hidden="true">▤</span>
+                      <div>
+                        <p className="eyebrow">ASSESSMENT CONTEXT</p>
+                        <h3 id="result-context-title">Information available for this check-in</h3>
+                      </div>
+                    </div>
+                    <div className="result-details-grid">
+                      <article>
+                        <h4>Symptoms and function</h4>
+                        <dl>
+                          <div><dt>Change from your usual symptoms</dt><dd>{reportedInputs ? ({ better: 'Better', same: 'About the same', worse: 'Worse' }[reportedInputs.symptom_change] ?? 'Not returned') : 'Not returned'}</dd></div>
+                          <div><dt>Fatigue</dt><dd>{reportedInputs ? `${reportedInputs.fatigue}/10` : 'Not returned'}</dd></div>
+                          <div><dt>Recent worsening episodes reported</dt><dd>{reportedInputs?.flares_30d ?? 'Not returned'}</dd></div>
+                          <div><dt>Physical activity today</dt><dd>{reportedInputs ? `${reportedInputs.activity_min} minutes` : 'Not returned'}</dd></div>
+                          <div><dt>Project symptom and function summary</dt><dd>{Number.isFinite(latestAssessment.assessment.rapid3) ? `${latestAssessment.assessment.rapid3.toFixed(1)} / 30` : 'Not available'}</dd></div>
+                        </dl>
+                        <p>Change from usual symptoms and physical activity are recorded for context, but are not used by the current heuristic.</p>
+                      </article>
+                      <article>
+                        <h4>Sleep and stress</h4>
+                        <dl>
+                          <div><dt>Sleep last night</dt><dd>{reportedInputs && sleepLabels[reportedInputs.sleep_difficulty] ? sleepLabels[reportedInputs.sleep_difficulty] : 'Not returned'}</dd></div>
+                          <div><dt>Stress or anxiety reported</dt><dd>{reportedInputs && anxietyLabels[reportedInputs.anxiety] ? anxietyLabels[reportedInputs.anxiety] : 'Not returned'}</dd></div>
+                        </dl>
+                        <p>Sleep and fatigue are used by the heuristic; stress or anxiety is recorded for context but is not used in the score.</p>
+                      </article>
+                      <article>
+                        <h4>HRV information</h4>
+                        <p>No HRV measurement was collected for this check-in. HRV model predictions are not used in the score.</p>
+                        <p>Optional pulse: {reportedInputs?.heart_rate_bpm == null ? 'Not provided' : `${reportedInputs.heart_rate_bpm} bpm`}. Pulse is not an HRV measurement and is not used by the current heuristic.</p>
+                      </article>
+                      <article>
+                        <h4>Environmental context</h4>
+                        {latestAssessment.weather ? (
+                          <>
+                            <p>{latestAssessment.weather.description || 'Weather description unavailable'} for {latestAssessment.weather.city || latestAssessment.assessment.city || 'your selected city'}.</p>
+                            <p>Temperature: {Number.isFinite(latestAssessment.weather.temperature) ? `${latestAssessment.weather.temperature} °C` : 'Not available'}; humidity: {Number.isFinite(latestAssessment.weather.humidity) ? `${latestAssessment.weather.humidity}%` : 'Not available'}; pressure: {Number.isFinite(latestAssessment.weather.pressure) ? `${latestAssessment.weather.pressure} hPa` : 'Not available'}.</p>
+                            <p>{latestAssessment.weather.is_live ? 'Live weather data' : 'Estimated weather fallback; live data was unavailable'}.</p>
+                            <p>Temperature and humidity are used by the heuristic; pressure is shown for context only.</p>
+                          </>
+                        ) : (
+                          <p>Environmental information was not returned for this check-in.</p>
+                        )}
+                      </article>
+                    </div>
+                  </section>
+
+                  <section className="result-details-section" aria-labelledby="result-factors-title">
+                    <div className="patient-section-heading">
+                      <span className="patient-section-icon" aria-hidden="true">i</span>
+                      <div>
+                        <p className="eyebrow">HOW THE SCORE IS BUILT</p>
+                        <h3 id="result-factors-title">Factors in the current calculation</h3>
+                      </div>
+                    </div>
+                    <p>These are the additive terms returned by the heuristic, shown as score points before its final rule adjustments. They are not probabilities, model outputs, or clinical risk estimates.</p>
+                    {resultContributions.length > 0 ? (
+                      <ul className="result-factor-list">
+                        {resultContributions.map(([name, value]) => (
+                          <li key={name}>
+                            <span>{contributionLabels[name] ?? name}</span>
+                            <strong>{(value * 100).toFixed(1)} score points</strong>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p role="status">Factor details are not available for this check-in.</p>
+                    )}
+                  </section>
+
+                  <section className="patient-next-steps" aria-labelledby="monitoring-plan-title">
                     <div className="patient-section-heading">
                       <span className="patient-section-icon" aria-hidden="true">✓</span>
                       <div>
-                        <p className="eyebrow">YOUR NEXT STEPS</p>
-                        <h3>What you can do next</h3>
+                        <p className="eyebrow">NOT A FORECAST</p>
+                        <h3 id="monitoring-plan-title">Next 3 Days: Symptom Monitoring Plan</h3>
                       </div>
                     </div>
                     <ul>
-                      <li><strong>Keep checking in:</strong> record how your pain, fatigue, sleep and daily activities change over time.</li>
-                      <li><strong>Look for changes:</strong> compare future check-ins with how you usually feel, rather than relying on one score.</li>
-                      <li><strong>Ask for support when needed:</strong> contact your healthcare professional if symptoms persist, worsen, or concern you. Do not change medication based on this result.</li>
+                      <li><strong>Day 1:</strong> Note your pain, fatigue, sleep, and daily function in your own words.</li>
+                      <li><strong>Day 2:</strong> Record the same symptoms and note any changes compared with yesterday.</li>
+                      <li><strong>Day 3:</strong> Record symptoms again and share persistent or concerning changes with your healthcare professional.</li>
+                    </ul>
+                    <p>Continue your existing treatment plan. Contact your rheumatology team or healthcare professional if symptoms worsen, persist, or concern you. Do not change medication based on this page.</p>
+                    <p>This is a reminder to monitor and record symptoms. It does not predict whether a flare will occur.</p>
+                  </section>
+
+                  <aside className="result-safety-notice" role="note">
+                    <strong>Research prototype — not for medical decisions.</strong>
+                    <p>This is not a diagnosis and does not provide a clinically validated prediction. Do not start, stop, or change medication based on this score. Contact your healthcare professional if symptoms worsen or cause concern.</p>
+                  </aside>
+
+                  <section className="result-details-section" aria-labelledby="clinical-measures-title">
+                    <div className="patient-section-heading">
+                      <span className="patient-section-icon" aria-hidden="true">+</span>
+                      <div>
+                        <p className="eyebrow">CLINICAL CONTEXT</p>
+                        <h3 id="clinical-measures-title">Patient-reported symptoms are not a clinical disease-activity assessment</h3>
+                      </div>
+                    </div>
+                    <p>
+                      This check-in records pain, fatigue, patient global health, and selected daily-function and sleep responses. It does not collect morning stiffness, clinician-counted tender or swollen joints, or ESR/CRP inflammatory markers. These missing clinical measures are not inferred.
+                    </p>
+                    <p>
+                      The 0–30 summary above uses this prototype’s selected questions and arithmetic; it is not a validated RAPID3 instrument. This page does not calculate DAS28, CDAI, or SDAI. Symptom reports and this heuristic cannot diagnose a flare, remission, or active RA.
+                    </p>
+                    <p>
+                      Clinical guidelines describe disease-activity monitoring and treatment targets as part of care with a healthcare professional. The references below provide clinical context; they do not validate this prototype’s score.
+                    </p>
+                    <ul className="clinical-reference-list">
+                      <li>
+                        <a href="https://www.nice.org.uk/guidance/ng100/chapter/recommendations" target="_blank" rel="noreferrer">
+                          NICE NG100: Rheumatoid arthritis in adults—management
+                        </a>
+                        {' '}— includes disease-activity monitoring, flare management, and rapid access to specialist care if the condition suddenly worsens.
+                      </li>
+                      <li>
+                        <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC9273041/" target="_blank" rel="noreferrer">
+                          ACR 2021 Guideline for the Treatment of Rheumatoid Arthritis
+                        </a>
+                        {' '}— Arthritis Care &amp; Research 73(7):924–939; defines treat-to-target using frequent monitoring and validated instruments toward low disease activity or remission.
+                      </li>
+                      <li>
+                        <a href="https://ard.bmj.com/content/80/10/1278" target="_blank" rel="noreferrer">
+                          2021 EULAR recommendations for self-management in inflammatory arthritis
+                        </a>
+                        {' '}— Annals of the Rheumatic Diseases 80(10):1278–1285; supports patient education and self-management resources as part of routine care.
+                      </li>
                     </ul>
                   </section>
 
                   <details className="interpretation-details">
                     <summary>Technical details and important limitations</summary>
                     <ul>
-                      <li>The experimental score is a heuristic, not a calibrated flare probability.</li>
-                      <li>The risk calculation does not combine trained model predictions.</li>
-                      <li>Any future scores are deterministic projections, not trained forecasts.</li>
-                      <li>Weather information may use an estimated fallback rather than live measurements.</li>
-                      <li>A score of zero does not by itself confirm remission or establish a diagnosis.</li>
+                      <li>The displayed score rescales the current rule-based heuristic to 0–100 score points. It is not a percentage chance.</li>
+                      <li>The calculation uses patient-reported pain, function, overall health, recent worsening episodes, sleep difficulty, fatigue, humidity, and temperature. Threshold adjustments can change the final value from the displayed factor sum. Stress, activity, symptom-change response, optional pulse, and weather pressure are not used.</li>
+                      <li>Trained modality model predictions are not combined, and a trained fusion model is unavailable.</li>
+                      <li>No validated three-day RA flare forecast is available. The monitoring plan above is not a forecast.</li>
+                      <li>Weather may be an estimate when live data is unavailable; optional pulse is not used by the current heuristic.</li>
                     </ul>
-                    <p>This research prototype is not a diagnosis and does not replace advice from your healthcare professional.</p>
                   </details>
 
                   {isGuest && (
@@ -968,7 +1088,7 @@ function App() {
                     <div className="history-row">
                       <strong>{new Date(latestAssessment.assessment.created_at).toLocaleString()}</strong>
                       <span>Pain: {latestAssessment.assessment.pain}/10</span>
-                      <span>RAPID3: {latestAssessment.assessment.rapid3.toFixed(1)}</span>
+                      <span>Project-specific symptom and function summary: {latestAssessment.assessment.rapid3.toFixed(1)} / 30 (not a validated instrument)</span>
                     </div>
                   ) : (
                     <div className="empty-state">Complete an assessment to see its result here.</div>
@@ -976,14 +1096,14 @@ function App() {
                 </>
               ) : (
                 <>
-                  <p>Your saved assessments, newest first.</p>
+                  <p>Your saved assessments, newest first. Earlier question-set versions are not recorded, so this history does not compare changes in disease activity.</p>
                   <button
                     type="button"
                     className="secondary-button"
                     onClick={() => void loadAssessmentHistory()}
                     disabled={historyLoading}
                   >
-                    {historyLoading ? 'Refreshing?' : 'Refresh history'}
+                    {historyLoading ? 'Refreshing history…' : 'Refresh history'}
                   </button>
 
                   {historyError && (
@@ -993,7 +1113,7 @@ function App() {
                   )}
 
                   {historyLoading ? (
-                    <p>Loading your saved assessments?</p>
+                    <p>Loading your saved assessments…</p>
                   ) : historyItems.length > 0 ? (
                     <div className="history-list">
                       {historyItems.map((item, index) => (
@@ -1004,15 +1124,11 @@ function App() {
                           <strong>{new Date(item.created_at).toLocaleString()}</strong>
                           <span>City: {item.city || 'Not recorded'}</span>
                           <span>
-                            RAPID3: {item.rapid3 == null ? 'Not available' : item.rapid3.toFixed(1)}
+                            Project-specific symptom and function summary: {item.rapid3 == null ? 'Not available' : `${item.rapid3.toFixed(1)} / 30`} (not a validated instrument)
                           </span>
                           <span>
-                            Experimental score:{' '}
-                            {item.peak_experimental_score == null
-                              ? 'Not available'
-                              : `${(item.peak_experimental_score * 100).toFixed(1)}%`}
+                            Experimental score: Not available in historical records (they store a legacy peak value).
                           </span>
-                          <span>Risk level: {item.risk_level || 'Not available'}</span>
                         </article>
                       ))}
                     </div>
@@ -1030,44 +1146,40 @@ function App() {
           )}
 
           {activePage === 'Assessment' && (
-  <AssessmentPage
-    isGuest={isGuest}
-    onSubmissionStart={() => {
-      setLatestAssessment(null)
-      return ++assessmentRequestVersion.current
-    }}
-    isSubmissionCurrent={(requestVersion) =>
-      requestVersion === assessmentRequestVersion.current
-    }
-    onResult={(requestVersion, result) => {
-      if (requestVersion !== assessmentRequestVersion.current) {
-        return
-      }
-      setLatestAssessment(result)
-      if (!isGuest) {
-        void loadAssessmentHistory()
-      }
-      setActivePage('Results')
-      window.scrollTo({ top: 0, behavior: 'smooth' })
-    }}
-  />
-)
-
-
-}
+            <AssessmentPage
+              isGuest={isGuest}
+              onSubmissionStart={() => {
+                setLatestAssessment(null)
+                return ++assessmentRequestVersion.current
+              }}
+              isSubmissionCurrent={(requestVersion) =>
+                requestVersion === assessmentRequestVersion.current
+              }
+              onResult={(requestVersion, result) => {
+                if (requestVersion !== assessmentRequestVersion.current) {
+                  return
+                }
+                setLatestAssessment(result)
+                if (!isGuest) {
+                  void loadAssessmentHistory()
+                }
+                setActivePage('Results')
+                window.scrollTo({ top: 0, behavior: 'smooth' })
+              }}
+            />
+          )}
 
           {activePage === 'Forecast History' && (
             <section className="panel secondary-page">
               <span className="stat-icon lavender">▤</span>
-              <h2>Forecast history</h2>
+              <h2>Forecast availability</h2>
               <p>
-                No real forecasts are connected yet. This page will
-                display timestamped model outputs and later recorded
-                outcomes when a properly evaluated prediction pipeline
-                is integrated.
+                FlareGuard does not currently provide a clinically validated
+                72-hour RA flare forecast. Use the symptom monitoring plan on
+                your assessment summary to record changes; it is not a forecast.
               </p>
               <div className="empty-state">
-                No forecasts available in this demo.
+                No validated forecast results are available.
               </div>
             </section>
           )}
@@ -1224,7 +1336,7 @@ function AssessmentPage({
         <div className="guided-step-dots">{stepTitles.map((title, index) => <span key={title} className={index <= step ? 'complete' : ''} aria-label={title}>{index + 1}</span>)}</div>
       </div>
 
-      <form onSubmit={handleSubmit}>
+      <form onSubmit={handleSubmit} aria-busy={busy}>
         {step === 0 && <div className="guided-step-content">
           <div className="guided-intro"><span className="guided-emoji">👋</span><div><h3>Let's start with a little about you</h3><p>This information helps describe the people taking part in the research.</p></div></div>
           <label className="guided-question">How old are you? <span className="required-note">Required</span>
@@ -1300,6 +1412,7 @@ function AssessmentPage({
         </div>}
 
         {error && <div className="auth-error" role="alert"><strong>Please check:</strong> {error}</div>}
+        {busy && <p role="status" aria-live="polite">Calculating your assessment. Please wait.</p>}
         <div className="guided-actions">
           {step > 0 && <button className="secondary-button" type="button" onClick={previousStep} disabled={busy}>← Back</button>}
           {step < stepTitles.length - 1
