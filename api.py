@@ -8,6 +8,7 @@ currently available.
 
 import hashlib
 import importlib.util
+import json
 import os
 import secrets
 import sys
@@ -135,6 +136,79 @@ def init_session_table():
         )
 
 
+def init_daily_checkins_table():
+    """Create storage for patients' daily symptom check-ins."""
+    with connect_db() as conn:
+        execute_sql(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS api_daily_checkins (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                checkin_date TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                rapid3 REAL NOT NULL,
+                function_score REAL NOT NULL,
+                experimental_score REAL NOT NULL,
+                risk_level TEXT NOT NULL
+            )
+            """
+        )
+
+        execute_sql(
+            conn,
+            """
+            CREATE INDEX IF NOT EXISTS idx_daily_checkins_user_date
+            ON api_daily_checkins(username, checkin_date)
+            """
+        )
+
+
+def save_daily_checkin(
+    username: str,
+    assessment: 'AssessmentRequest',
+    rapid3: float,
+    function_score: float,
+    experimental_score: float,
+    risk_level: str,
+):
+    """Persist the reported inputs and assessment summary."""
+    init_daily_checkins_table()
+
+    now = datetime.now(timezone.utc)
+    payload = assessment.model_dump()
+
+    with connect_db() as conn:
+        execute_sql(
+            conn,
+            """
+            INSERT INTO api_daily_checkins (
+                id,
+                username,
+                checkin_date,
+                created_at,
+                payload_json,
+                rapid3,
+                function_score,
+                experimental_score,
+                risk_level
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                secrets.token_hex(16),
+                username,
+                now.date().isoformat(),
+                now.isoformat(),
+                json.dumps(payload),
+                float(rapid3),
+                float(function_score),
+                float(experimental_score),
+                risk_level,
+            ),
+        )
+
 def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -259,6 +333,7 @@ def delete_session_cookie(response: Response):
 
 
 init_session_table()
+init_daily_checkins_table()
 
 
 # ============================================================
@@ -580,6 +655,15 @@ def create_assessment(
                 detail="The assessment was calculated but could not be saved.",
             )
 
+        save_daily_checkin(
+            username=username,
+            assessment=assessment,
+            rapid3=rapid3,
+            function_score=fn_score,
+            experimental_score=risk_score,
+            risk_level=level,
+        )
+
         category, category_color = fusion.rapid3_category(rapid3)
 
         return {
@@ -767,6 +851,63 @@ def create_guest_assessment(assessment: AssessmentRequest):
 
 
 # ============================================================
+# DAILY SYMPTOM CHECK-IN HISTORY
+# ============================================================
+
+@app.get("/api/daily-checkins")
+def daily_checkin_history(
+    request: Request,
+    limit: int = 30,
+):
+    """Return the signed-in patient's daily check-ins."""
+    username = get_session_username(request)
+
+    if limit < 1 or limit > 100:
+        raise HTTPException(
+            status_code=422,
+            detail="Limit must be between 1 and 100.",
+        )
+
+    init_daily_checkins_table()
+
+    with connect_db() as conn:
+        rows = execute_sql(
+            conn,
+            """
+            SELECT
+                checkin_date,
+                created_at,
+                payload_json,
+                rapid3,
+                function_score,
+                experimental_score,
+                risk_level
+            FROM api_daily_checkins
+            WHERE username = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (username, limit),
+        ).fetchall()
+
+    return {
+        "success": True,
+        "count": len(rows),
+        "checkins": [
+            {
+                "date": row[0],
+                "created_at": row[1],
+                "symptoms": json.loads(row[2]),
+                "rapid3": row[3],
+                "function_score": row[4],
+                "experimental_score": row[5],
+                "risk_level": row[6],
+            }
+            for row in rows
+        ],
+    }
+
+# ============================================================
 # ASSESSMENT HISTORY
 # ============================================================
 
@@ -809,6 +950,137 @@ def assessment_history(
             detail=f"Could not retrieve history ({type(exc).__name__}).",
         ) from exc
 
+
+# ============================================================
+# RESEARCH-ONLY SYMPTOM-WORSENING PREDICTION
+# ============================================================
+
+class SymptomWorseningRequest(BaseModel):
+    """Features required by the saved Flaredown research model."""
+
+    past_mean_severity: float = Field(allow_inf_nan=False)
+    past_std_severity: float = Field(ge=0, allow_inf_nan=False)
+    past_trend: float = Field(allow_inf_nan=False)
+    past_last_severity: float = Field(allow_inf_nan=False)
+    past_engagement: float = Field(ge=0, allow_inf_nan=False)
+    personal_baseline: float = Field(allow_inf_nan=False)
+    age: float = Field(gt=0, le=120, allow_inf_nan=False)
+    sex: str = Field(min_length=1, max_length=40)
+
+
+RESEARCH_MODEL_PATH = BASE_DIR / "models" / "flaredown_candidate_model.pkl"
+
+RESEARCH_FEATURES = [
+    "past_mean_severity",
+    "past_std_severity",
+    "past_trend",
+    "past_last_severity",
+    "past_engagement",
+    "personal_baseline",
+    "age",
+    "sex",
+]
+
+
+@app.post("/api/research/symptom-worsening-prediction")
+def predict_symptom_worsening(payload: SymptomWorseningRequest):
+    """
+    Experimental prediction of the dataset-defined symptom-worsening target.
+
+    This is not a clinically validated RA flare prediction.
+    """
+    try:
+        import joblib
+        import pandas as pd
+
+        if not RESEARCH_MODEL_PATH.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail="The research prediction model is unavailable.",
+            )
+
+        artifact = joblib.load(RESEARCH_MODEL_PATH)
+
+        if not isinstance(artifact, dict):
+            raise RuntimeError("Unexpected research model artifact format.")
+
+        model = artifact.get("model")
+        saved_columns = artifact.get("cols")
+
+        if model is None or saved_columns != RESEARCH_FEATURES:
+            raise RuntimeError("Research model features do not match the API.")
+
+        sex_value = payload.sex.strip().lower()
+        if not sex_value:
+            raise HTTPException(
+                status_code=422,
+                detail="The sex field must not be blank.",
+            )
+
+        feature_row = {
+            "past_mean_severity": payload.past_mean_severity,
+            "past_std_severity": payload.past_std_severity,
+            "past_trend": payload.past_trend,
+            "past_last_severity": payload.past_last_severity,
+            "past_engagement": payload.past_engagement,
+            "personal_baseline": payload.personal_baseline,
+            "age": payload.age,
+            "sex": sex_value,
+        }
+
+        features = pd.DataFrame(
+            [[feature_row[column] for column in RESEARCH_FEATURES]],
+            columns=RESEARCH_FEATURES,
+        )
+
+        predicted_class = int(model.predict(features)[0])
+
+        if not hasattr(model, "predict_proba"):
+            raise RuntimeError("Research model does not support score output.")
+
+        probabilities = model.predict_proba(features)[0]
+        classes = list(model.classes_)
+
+        if 1 not in classes:
+            raise RuntimeError("Positive target class is missing.")
+
+        positive_index = classes.index(1)
+        model_score = float(probabilities[positive_index])
+
+        return {
+            "success": True,
+            "research_only": True,
+            "target": "dataset_defined_symptom_worsening",
+            "prediction": {
+                "class": predicted_class,
+                "label": (
+                    "symptom_worsening_proxy"
+                    if predicted_class == 1
+                    else "no_symptom_worsening_proxy"
+                ),
+                "positive_class_model_score": round(model_score, 4),
+            },
+            "model": {
+                "name": artifact.get("best", "Saved research candidate"),
+                "evaluation_split": artifact.get("split"),
+            },
+            "limitations": [
+                "The target is a dataset-defined symptom-worsening proxy, not a confirmed clinical RA flare.",
+                "The model score is not a calibrated clinical probability.",
+                "This prediction uses supplied historical summary features, not the current assessment questionnaire.",
+                "The model has limited held-out patient evaluation and requires further validation.",
+                "This research output is not a diagnosis or a substitute for clinical care.",
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Keep internal paths and stack traces out of API responses.
+        raise HTTPException(
+            status_code=503,
+            detail="The research prediction could not be completed.",
+        ) from exc
 
 # ============================================================
 # RUN WITH:

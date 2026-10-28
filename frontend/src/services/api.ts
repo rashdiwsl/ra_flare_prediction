@@ -276,3 +276,87 @@ export function getAssessmentHistory(limit?: number) {
     `/api/assessments?limit=${safeLimit}`,
   )
 }
+
+
+export interface ResearchPredictionInput {
+  past_mean_severity: number
+  past_std_severity: number
+  past_trend: number
+  past_last_severity: number
+  past_engagement: number
+  personal_baseline: number
+  age: number
+  sex: string
+}
+
+export interface ResearchPredictionResult {
+  success: boolean
+  research_only: boolean
+  target: string
+  prediction: {
+    class: number
+    label: 'symptom_worsening_proxy' | 'no_symptom_worsening_proxy'
+    positive_class_model_score: number
+  }
+  model: {
+    name: string
+    evaluation_split: string | null
+  }
+  limitations: string[]
+}
+
+export function predictResearchSymptomWorsening(
+  data: ResearchPredictionInput,
+) {
+  return request<ResearchPredictionResult>(
+    '/api/research/symptom-worsening-prediction',
+    {
+      method: 'POST',
+      body: JSON.stringify(data),
+    },
+  )
+}
+
+/* ============================================================
+   DAILY SYMPTOM CHECK-IN HISTORY
+   ============================================================ */
+
+export interface DailyCheckinSymptoms {
+  age: number
+  symptom_change: 'better' | 'same' | 'worse'
+  city: string
+  fn_vals: Record<string, number>
+  pain: number
+  global_estimate: number
+  fatigue: number
+  flares_30d: number
+  duration_years: number
+  sleep_diff: number
+  anxiety: number
+  activity_min: number
+  heart_rate: number
+}
+
+export interface DailyCheckin {
+  date: string
+  created_at: string
+  symptoms: DailyCheckinSymptoms
+  rapid3: number
+  function_score: number
+  experimental_score: number
+  risk_level: string
+}
+
+export interface DailyCheckinHistory {
+  success: boolean
+  count: number
+  checkins: DailyCheckin[]
+}
+
+export function getDailyCheckins(limit = 30) {
+  const safeLimit = Math.min(100, Math.max(1, Math.floor(limit)))
+
+  return request<DailyCheckinHistory>(
+    `/api/daily-checkins?limit=${safeLimit}`,
+  )
+}
