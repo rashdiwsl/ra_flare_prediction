@@ -257,6 +257,8 @@ class FusionSafetyTests(unittest.TestCase):
                             api_module, "get_session_username", return_value="test-user"
                         ), patch.object(
                             api_module.fusion, "save_assessment", return_value=True
+                        ), patch.object(
+                            api_module, "save_daily_checkin", return_value=None
                         ):
                             authenticated_response = client.post(
                                 "/api/assessments",

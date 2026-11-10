@@ -1121,7 +1121,15 @@ function App() {
                       <span className="result-metric-note">Your answer</span>
                     </article>
                   </div>
-
+<section className="next-steps-card" aria-labelledby="next-steps-title">
+  <p className="eyebrow">WHAT TO DO WITH THIS SUMMARY</p>
+  <h3 id="next-steps-title">Next steps</h3>
+  <ul>
+    <li>Use this summary to track how you feel between clinic visits.</li>
+    <li>Share your saved history with your rheumatology team at your next appointment.</li>
+    <li>If your symptoms are getting worse or you are worried, contact your doctor or clinic. This app cannot tell you whether you are having a flare.</li>
+  </ul>
+</section>
                   <section
                     className="patient-meaning-section"
                     aria-labelledby="assessment-details-title"
