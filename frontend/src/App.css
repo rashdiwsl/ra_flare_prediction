@@ -3528,3 +3528,9 @@ p {
 }
 .next-steps-card ul { margin: 8px 0 0 18px; padding: 0; }
 .next-steps-card li { margin-bottom: 8px; line-height: 1.5; }
+
+.brand-mark img {
+  display: block;
+  width: 62%;
+  height: 62%;
+}

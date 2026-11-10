@@ -125,7 +125,7 @@ function AuthScreen({
             href="#"
             onClick={(event) => event.preventDefault()}
           >
-            <span className="brand-mark">F</span>
+            <span className="brand-mark"><img src="/logo-mark.svg" alt="" aria-hidden="true" /></span>
             <span>FlareGuard</span>
           </a>
 
@@ -171,7 +171,7 @@ function AuthScreen({
             href="#"
             onClick={(event) => event.preventDefault()}
           >
-            <span className="brand-mark">F</span>
+            <span className="brand-mark"><img src="/logo-mark.svg" alt="" aria-hidden="true" /></span>
             <span>
               <strong>FlareGuard</strong>
               <small>YOUR HEALTH, IN FOCUS</small>
@@ -499,7 +499,7 @@ function App() {
     return (
       <main className="auth-page">
         <div className="auth-loading">
-          <span className="brand-mark">F</span>
+          <span className="brand-mark"><img src="/logo-mark.svg" alt="" aria-hidden="true" /></span>
           <p>Preparing your FlareGuard space…</p>
         </div>
       </main>
@@ -556,7 +556,7 @@ function App() {
             navigateTo('Overview')
           }}
         >
-          <span className="brand-mark">F</span>
+          <span className="brand-mark"><img src="/logo-mark.svg" alt="" aria-hidden="true" /></span>
           <span>
             <strong>FlareGuard</strong>
             <small>YOUR HEALTH, IN FOCUS</small>
