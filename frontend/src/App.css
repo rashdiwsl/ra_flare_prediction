@@ -3531,6 +3531,10 @@ p {
 
 .brand-mark img {
   display: block;
-  width: 62%;
-  height: 62%;
+  width: 74%;
+  height: 74%;
+}
+.auth-disclaimer {
+  font-size: 0.8rem;
+  color: #4b5b58;
 }

@@ -151,8 +151,8 @@ function AuthScreen({
             <div>
               <strong>Your wellbeing, at a glance</strong>
               <p>
-                Explore symptom tracking and discover how daily
-                check-ins can help you reflect on changes over time.
+                Track your rheumatoid arthritis symptoms between
+                clinic visits and reflect on changes over time.
               </p>
             </div>
           </div>
