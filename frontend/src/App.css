@@ -3538,3 +3538,19 @@ p {
   font-size: 0.8rem;
   color: #4b5b58;
 }
+.print-result-button {
+  margin-top: 12px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: 1px solid #1c625b;
+  background: #ffffff;
+  color: #1c625b;
+  font-weight: 600;
+  cursor: pointer;
+}
+@media print {
+  .sidebar,
+  .print-result-button {
+    display: none !important;
+  }
+}
