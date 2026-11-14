@@ -1062,6 +1062,124 @@ function App() {
                     </p>
                   </article>
 
+                  {(() => {
+                    const pts = Number.isFinite(resultScore)
+                      ? Math.min(100, Math.max(0, (resultScore as number) * 100))
+                      : null
+                    const ra = latestAssessment?.assessment
+                    if (pts === null || !ra) return null
+                    const ri = ra.reported_inputs
+                    const word = (v: number) =>
+                      v <= 0 ? 'none' : v <= 3 ? 'mild' : v <= 6 ? 'moderate' : 'severe'
+                    const band = pts > 60 ? 'higher' : pts > 30 ? 'middle' : 'lower'
+                    const previous = historyItems.find(
+                      (item) =>
+                        item.created_at !== ra.created_at && item.rapid3 != null,
+                    )
+                    const diff =
+                      previous && Number.isFinite(ra.rapid3)
+                        ? ra.rapid3 - (previous.rapid3 as number)
+                        : null
+                    const lines: string[] = []
+                    if (Number.isFinite(ra.pain))
+                      lines.push(`Pain: ${ra.pain}/10 (${word(ra.pain)}).`)
+                    if (ri && Number.isFinite(ri.fatigue))
+                      lines.push(`Tiredness: ${ri.fatigue}/10 (${word(ri.fatigue)}).`)
+                    if (ri && sleepLabels[ri.sleep_difficulty])
+                      lines.push(`Sleep: ${sleepLabels[ri.sleep_difficulty].toLowerCase()}.`)
+                    if (ri && anxietyLabels[ri.anxiety])
+                      lines.push(`Feeling anxious: ${anxietyLabels[ri.anxiety].toLowerCase()}.`)
+                    if (ri)
+                      lines.push(
+                        `Compared with before, you said your symptoms feel ${
+                          ri.symptom_change === 'worse'
+                            ? 'worse'
+                            : ri.symptom_change === 'better'
+                              ? 'better'
+                              : 'about the same'
+                        }.`,
+                      )
+                    if (ri && Number.isFinite(ri.flares_30d))
+                      lines.push(
+                        `Worsening episodes in the past 30 days: ${ri.flares_30d}.`,
+                      )
+                    if (diff !== null)
+                      lines.push(
+                        Math.abs(diff) < 1
+                          ? 'Your overall summary is about the same as your last check-in.'
+                          : diff > 0
+                            ? 'Your overall summary is higher than your last check-in (more symptoms reported).'
+                            : 'Your overall summary is lower than your last check-in (fewer symptoms reported).',
+                      )
+                    const reachOut =
+                      band === 'higher' ||
+                      ri?.symptom_change === 'worse' ||
+                      (Number.isFinite(ra.pain) && ra.pain >= 7) ||
+                      (diff !== null && diff >= 2)
+                    return (
+                      <section
+                        className="score-guide-card"
+                        aria-labelledby="score-guide-title"
+                      >
+                        <p className="eyebrow">YOUR CHECK-IN IN PLAIN WORDS</p>
+                        <h3 id="score-guide-title">
+                          Your summary: {pts.toFixed(0)} out of 100 ({band} range)
+                        </h3>
+                        <div
+                          className="score-guide-scale"
+                          role="img"
+                          aria-label={`Score ${pts.toFixed(0)} out of 100, in the ${band} range`}
+                        >
+                          <div className="score-guide-track">
+                            <span className="score-guide-seg seg-low" />
+                            <span className="score-guide-seg seg-mid" />
+                            <span className="score-guide-seg seg-high" />
+                            <span
+                              className="score-guide-marker"
+                              style={{ left: `${pts}%` }}
+                            />
+                          </div>
+                          <div className="score-guide-labels">
+                            <span>0 · Lower</span>
+                            <span>30–60 · Middle</span>
+                            <span>Higher · 100</span>
+                          </div>
+                        </div>
+                        <p>
+                          This number adds up what you reported. It is not a
+                          percentage chance of a flare, and it does not
+                          diagnose one.
+                        </p>
+                        <h4>What you told us</h4>
+                        <ul>
+                          {lines.map((line) => (
+                            <li key={line}>{line}</li>
+                          ))}
+                        </ul>
+                        {reachOut ? (
+                          <p className="score-guide-reach">
+                            <strong>You do not have to wait for your next appointment.</strong>{' '}
+                            Your answers suggest things are harder than usual. Consider
+                            contacting your clinic to let them know how you feel now.
+                          </p>
+                        ) : null}
+                        <h4>What you can do today</h4>
+                        <ul>
+                          <li>Pace your day: alternate activity with rest.</li>
+                          <li>Many people find warmth helps stiffness. Gentle movement can help if it is comfortable.</li>
+                          <li>Note which joints hurt, how long morning stiffness lasts, and what changed. Show this to your care team.</li>
+                          <li>Keep taking your medicines as prescribed. Do not change them without asking your doctor.</li>
+                        </ul>
+                        <h4>Get help sooner if</h4>
+                        <ul>
+                          <li>A joint is hot, red and very swollen, or you have a fever with joint pain.</li>
+                          <li>Your pain suddenly becomes severe, or you feel new weakness or numbness.</li>
+                          <li>You feel very unwell or unsafe. Contact your clinic or urgent care.</li>
+                        </ul>
+                      </section>
+                    )
+                  })()}
+
                   <div className="result-metrics-grid">
                     <article className="result-metric-card">
                       <span

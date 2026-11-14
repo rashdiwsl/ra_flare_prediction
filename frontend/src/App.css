@@ -3554,3 +3554,17 @@ p {
     display: none !important;
   }
 }
+.score-guide-card { margin-top: 16px; border: 1px solid #dcebe2; border-radius: 18px; padding: clamp(18px, 3vw, 24px); background: #fff; }
+.score-guide-card h3 { margin: 6px 0 14px; font-size: 1.15rem; color: #1f2937; }
+.score-guide-card p, .score-guide-card li { color: #4d5968; font-size: .92rem; line-height: 1.55; }
+.score-guide-card ul { margin: 10px 0 0; padding-left: 20px; }
+.score-guide-track { position: relative; display: flex; height: 14px; border-radius: 999px; overflow: visible; }
+.score-guide-seg { height: 100%; }
+.score-guide-seg.seg-low { width: 30%; background: #bfe6cf; border-radius: 999px 0 0 999px; }
+.score-guide-seg.seg-mid { width: 30%; background: #f6e0a3; }
+.score-guide-seg.seg-high { width: 40%; background: #f2b8b5; border-radius: 0 999px 999px 0; }
+.score-guide-marker { position: absolute; top: -5px; width: 6px; height: 24px; margin-left: -3px; border-radius: 3px; background: #14233d; }
+.score-guide-labels { display: flex; justify-content: space-between; margin: 10px 0 12px; color: #697586; font-size: .78rem; }
+
+.score-guide-card h4 { margin: 16px 0 6px; font-size: .95rem; color: #1f2937; }
+.score-guide-reach { margin-top: 14px; padding: 12px 14px; border-radius: 12px; background: #fff7e6; border: 1px solid #f3dca8; color: #5c4400 !important; }
